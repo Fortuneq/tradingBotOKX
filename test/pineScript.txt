@@ -1,0 +1,79 @@
+//@version=6
+strategy("BTC/USDT Smart Long & Short (Daily VWAP)", overlay=true,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// === INPUTS ===
+rsiLength      = input.int(2,   "RSI Length")
+rsiOverbought  = input.int(72,  "RSI Over-bought")
+rsiOversold    = input.int(28,  "RSI Over-sold")
+minVol         = input.float(50,"Min Volume Filter")
+cooldownBars   = input.int(2,   "Cooldown (bars)")
+atrLength      = input.int(14,  "ATR Length")
+atrMultiplier  = input.float(1.5,"SL/TP ATR Multiplier")
+useTrailing    = input.bool(true,"Use Trailing Stop")
+trailingPerc   = input.float(1.5,"Trailing %")
+
+// === INDICATORS ===
+rsi = ta.rsi(close, rsiLength)
+atr = ta.atr(atrLength)
+
+// === DAILY VWAP ===
+var float dailySumPV = 0.0
+var float dailySumV  = 0.0
+
+// 1) преобразуем ta.change → bool
+newDay = ta.change(time("D")) != 0
+
+if newDay
+    dailySumPV := 0.0
+    dailySumV  := 0.0
+
+dailySumPV += hlc3 * volume
+dailySumV  += volume
+vwapDaily   = dailySumV > 0 ? dailySumPV / dailySumV : close
+
+// === COOLDOWN ===
+var int lastShortBar = na
+var int lastLongBar  = na
+
+canShort = na(lastShortBar) or (bar_index - lastShortBar > cooldownBars)
+canLong  = na(lastLongBar)  or (bar_index - lastLongBar  > cooldownBars)
+
+// === REJECTION ===
+bearishRejection = close < close[1] and close > vwapDaily
+bullishRejection = close > close[1] and close < vwapDaily
+
+// === SHORT ===
+shortCond = ta.crossunder(rsi, rsiOverbought) and volume > minVol and bearishRejection and canShort
+if shortCond
+    strategy.entry("Short", strategy.short)
+    if useTrailing
+        strategy.exit("Short Exit", from_entry="Short",
+                      trail_points = trailingPerc * close * 0.01,
+                      trail_offset = trailingPerc * close * 0.01)
+    else
+        sl = atr * atrMultiplier
+        tp = atr * atrMultiplier
+        strategy.exit("Short Exit", from_entry="Short", loss=sl, profit=tp)
+    lastShortBar := bar_index
+
+// === LONG ===
+longCond = ta.crossover(rsi, rsiOversold) and volume > minVol and bullishRejection and canLong
+if longCond
+    strategy.entry("Long", strategy.long)
+    if useTrailing
+        strategy.exit("Long Exit", from_entry="Long",
+                      trail_points = trailingPerc * close * 0.01,
+                      trail_offset = trailingPerc * close * 0.01)
+    else
+        sl = atr * atrMultiplier
+        tp = atr * atrMultiplier
+        strategy.exit("Long Exit", from_entry="Long", loss=sl, profit=tp)
+    lastLongBar := bar_index
+
+// === PLOTS ===
+plot(vwapDaily, title="Daily VWAP", color=color.orange, linewidth=2)
+plotshape(shortCond, title="Short Signal", location=location.abovebar,
+         color=color.red, style=shape.triangledown, size=size.small)
+plotshape(longCond,  title="Long Signal", location=location.belowbar,
+         color=color.green, style=shape.triangleup, size=size.small)
