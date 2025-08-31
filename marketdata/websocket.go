@@ -200,14 +200,34 @@ func (s *OKXMarketDataService) processMessage(msg map[string]interface{}) {
 		return
 	}
 
-	// Handle ticker data
+	// Handle data messages
 	if arg, ok := msg["arg"].(map[string]interface{}); ok {
-		if channel, ok := arg["channel"].(string); ok && channel == "tickers" {
-			if data, ok := msg["data"].([]interface{}); ok && len(data) > 0 {
-				if tickerData, ok := data[0].(map[string]interface{}); ok {
-					if lastStr, ok := tickerData["last"].(string); ok {
-						if lastPrice, err := strconv.ParseFloat(lastStr, 64); err == nil && s.onPriceUpdate != nil {
-							s.onPriceUpdate(lastPrice)
+		if channel, ok := arg["channel"].(string); ok {
+			// Handle ticker data
+			if channel == "tickers" {
+				if data, ok := msg["data"].([]interface{}); ok && len(data) > 0 {
+					if tickerData, ok := data[0].(map[string]interface{}); ok {
+						if lastStr, ok := tickerData["last"].(string); ok {
+							if lastPrice, err := strconv.ParseFloat(lastStr, 64); err == nil && s.onPriceUpdate != nil {
+								s.onPriceUpdate(lastPrice)
+							}
+						}
+					}
+				}
+			}
+			// Handle candle data
+			if channel == "candle"+s.timeframe {
+				if data, ok := msg["data"].([]interface{}); ok && len(data) > 0 {
+					if candleArray, ok := data[0].([]interface{}); ok && len(candleArray) >= 6 {
+						// Convert to string array for parsing
+						candleStrings := make([]string, len(candleArray))
+						for i, v := range candleArray {
+							candleStrings[i] = fmt.Sprintf("%v", v)
+						}
+
+						// Create candle from WebSocket data
+						if candle, err := types.NewCandleFromRaw(candleStrings); err == nil && s.onCandleUpdate != nil {
+							s.onCandleUpdate(candle)
 						}
 					}
 				}

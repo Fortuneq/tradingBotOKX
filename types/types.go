@@ -35,6 +35,7 @@ const (
 // OrderRequest represents an order request
 type OrderRequest struct {
 	InstID    string    `json:"instId"`
+	TdMode    string    `json:"tdMode"` // Trading mode: cash for spot
 	Side      OrderSide `json:"side"`
 	OrderType string    `json:"ordType"`
 	Size      float64   `json:"sz,string"`
@@ -44,6 +45,7 @@ type OrderRequest struct {
 // AlgoOrderRequest represents an algorithmic order request
 type AlgoOrderRequest struct {
 	InstID     string    `json:"instId"`
+	TdMode     string    `json:"tdMode"` // Trading mode: cash for spot
 	Side       OrderSide `json:"side"`
 	Size       float64   `json:"sz,string"`
 	StopLoss   float64   `json:"slTriggerPx,string"`

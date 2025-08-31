@@ -73,6 +73,7 @@ func NewTradingBot(cfg *config.Config) (*TradingBot, error) {
 
 	// Set up event handlers
 	marketDataService.SetOnPriceUpdate(bot.onPriceUpdate)
+	marketDataService.SetOnCandleUpdate(bot.onCandleUpdate)
 	tradingStrategy.SetOnTradeSignal(bot.onTradeSignal)
 
 	return bot, nil
@@ -110,8 +111,8 @@ func (bot *TradingBot) Start(ctx context.Context) error {
 	bot.trailingTimer = time.NewTicker(1 * time.Second)
 	go bot.updateTrailingStopsOnExchange()
 
-	log.Printf("✅ Trading Bot started for %s", bot.config.OKX.InstrumentID)
-	log.Println("📊 Polling candles every 5 seconds")
+	log.Printf("✅ Trading Bot started for %s (SPOT)", bot.config.OKX.InstrumentID)
+	log.Printf("📊 Real-time %s candles via WebSocket + polling every 5 seconds", bot.config.OKX.Timeframe)
 	log.Println("🔄 Trailing stops updated every 1 second")
 
 	return nil
@@ -165,6 +166,7 @@ func (bot *TradingBot) PlaceManualOrder(side types.OrderSide, size float64) (boo
 
 	order := &types.OrderRequest{
 		InstID:    bot.config.OKX.InstrumentID,
+		TdMode:    "cash", // Spot trading mode
 		Side:      side,
 		OrderType: "market",
 		Size:      size,
@@ -219,6 +221,26 @@ func (bot *TradingBot) onPriceUpdate(price float64) {
 	bot.priceMu.Lock()
 	bot.lastPrice = price
 	bot.priceMu.Unlock()
+}
+
+// onCandleUpdate handles real-time candle updates from WebSocket
+func (bot *TradingBot) onCandleUpdate(candle *types.Candle) {
+	// Update price from candle close
+	bot.priceMu.Lock()
+	bot.lastPrice = candle.Close
+	bot.priceMu.Unlock()
+
+	// Skip if this is the same candle as before
+	if candle.Timestamp.Equal(bot.lastCandleTime) {
+		return
+	}
+
+	bot.lastCandleTime = candle.Timestamp
+	log.Printf("📊 New %s candle: O:%.2f H:%.2f L:%.2f C:%.2f V:%.1f",
+		bot.config.OKX.Timeframe, candle.Open, candle.High, candle.Low, candle.Close, candle.Volume)
+
+	// Process the new candle through the strategy
+	bot.tradingStrategy.Update(candle)
 }
 
 // onTradeSignal handles trading signals from the strategy
@@ -350,6 +372,7 @@ func (bot *TradingBot) processTrailingStops() {
 
 		algoOrder := &types.AlgoOrderRequest{
 			InstID:     bot.config.OKX.InstrumentID,
+			TdMode:     "cash", // Spot trading mode
 			Side:       closeSide,
 			Size:       pos.Size,
 			StopLoss:   newStop,

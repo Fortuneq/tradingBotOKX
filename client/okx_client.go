@@ -113,6 +113,30 @@ func (c *OKXRestClient) GetPositions(instType string) ([]types.PositionInfo, err
 	return response.Data, nil
 }
 
+// GetSpotBalance retrieves spot trading balance for specific currency
+func (c *OKXRestClient) GetSpotBalance(currency string) (*types.BalanceInfo, error) {
+	endpoint := fmt.Sprintf("/api/%s/account/balance", APIVersion)
+	if currency != "" {
+		endpoint += "?ccy=" + currency
+	}
+
+	var response struct {
+		Code    string              `json:"code"`
+		Message string              `json:"msg"`
+		Data    []types.BalanceInfo `json:"data"`
+	}
+
+	if err := c.sendRequestAndDecode("GET", endpoint, nil, &response); err != nil {
+		return nil, err
+	}
+
+	if len(response.Data) == 0 {
+		return &types.BalanceInfo{Currency: currency}, nil
+	}
+
+	return &response.Data[0], nil
+}
+
 // GetBalance retrieves account balance
 func (c *OKXRestClient) GetBalance(currency string) (*types.BalanceInfo, error) {
 	endpoint := fmt.Sprintf("/api/%s/account/balance", APIVersion)
@@ -185,7 +209,7 @@ func (c *OKXRestClient) PlaceTrailingStop(instID string, closeSide types.OrderSi
 
 	body := map[string]interface{}{
 		"instId":    instID,
-		"tdMode":    "isolated",
+		"tdMode":    "cash", // Spot trading mode
 		"side":      string(closeSide),
 		"ordType":   "move_order_stop",
 		"sz":        strconv.FormatFloat(size, 'f', -1, 64),
