@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,7 +20,7 @@ import (
 )
 
 const (
-	WebSocketURL   = "wss://ws.okx.com:8443/ws/v5/public"
+	WebSocketURL   = "wss://ws.okx.com:8443/ws/v5/business"
 	PingInterval   = 25 * time.Second
 	ReconnectDelay = 5 * time.Second
 	MaxRetries     = 5
@@ -53,9 +54,10 @@ type OKXMarketDataService struct {
 	pingTicker *time.Ticker
 
 	// State management
-	mu         sync.RWMutex
-	retryCount int
-	connected  bool
+	mu              sync.RWMutex
+	retryCount      int
+	connected       bool
+	zeroCandleCount int
 }
 
 // NewOKXMarketDataService creates a new market data service
@@ -117,11 +119,7 @@ func (s *OKXMarketDataService) connect() error {
 	// Start ping ticker
 	s.pingTicker = time.NewTicker(PingInterval)
 
-	// Authenticate and subscribe
-	if err := s.authenticate(); err != nil {
-		return fmt.Errorf("failed to authenticate: %w", err)
-	}
-
+	// Subscribe to public channels (no authentication needed for public channels)
 	if err := s.subscribe(); err != nil {
 		return fmt.Errorf("failed to subscribe: %w", err)
 	}
@@ -156,12 +154,16 @@ func (s *OKXMarketDataService) authenticate() error {
 
 // subscribe sends subscription message
 func (s *OKXMarketDataService) subscribe() error {
+	// Subscribe to candle channel only - pings keep connection alive for futures/swaps
+	channel := "candle" + strings.ToLower(strings.TrimSpace(s.timeframe))
+	instId := strings.ToUpper(strings.TrimSpace(s.instrumentID))
+	
 	subscribeMsg := map[string]interface{}{
 		"op": "subscribe",
 		"args": []map[string]interface{}{
 			{
-				"channel": "tickers",
-				"instId":  s.instrumentID,
+				"channel": channel,
+				"instId":  instId,
 			},
 		},
 	}
@@ -193,21 +195,21 @@ func (s *OKXMarketDataService) processMessages() {
 // processMessage processes individual WebSocket messages
 func (s *OKXMarketDataService) processMessage(msg map[string]interface{}) {
 	// Handle errors
-	if event, ok := msg["event"].(string); ok && event == "error" {
-		if msgText, ok := msg["msg"].(string); ok {
+	if event, ok := msg["event"] .(string); ok && event == "error" {
+		if msgText, ok := msg["msg"] .(string); ok {
 			log.Printf("⚠️ WebSocket error: %s", msgText)
 		}
 		return
 	}
 
 	// Handle data messages
-	if arg, ok := msg["arg"].(map[string]interface{}); ok {
-		if channel, ok := arg["channel"].(string); ok {
+	if arg, ok := msg["arg"] .(map[string]interface{}); ok {
+		if channel, ok := arg["channel"] .(string); ok {
 			// Handle ticker data
 			if channel == "tickers" {
-				if data, ok := msg["data"].([]interface{}); ok && len(data) > 0 {
+				if data, ok := msg["data"] .([]interface{}); ok && len(data) > 0 {
 					if tickerData, ok := data[0].(map[string]interface{}); ok {
-						if lastStr, ok := tickerData["last"].(string); ok {
+						if lastStr, ok := tickerData["last"] .(string); ok {
 							if lastPrice, err := strconv.ParseFloat(lastStr, 64); err == nil && s.onPriceUpdate != nil {
 								s.onPriceUpdate(lastPrice)
 							}
@@ -216,8 +218,8 @@ func (s *OKXMarketDataService) processMessage(msg map[string]interface{}) {
 				}
 			}
 			// Handle candle data
-			if channel == "candle"+s.timeframe {
-				if data, ok := msg["data"].([]interface{}); ok && len(data) > 0 {
+			if channel == "candle"+strings.ToLower(s.timeframe) {
+				if data, ok := msg["data"] .([]interface{}); ok && len(data) > 0 {
 					if candleArray, ok := data[0].([]interface{}); ok && len(candleArray) >= 6 {
 						// Convert to string array for parsing
 						candleStrings := make([]string, len(candleArray))
@@ -227,6 +229,26 @@ func (s *OKXMarketDataService) processMessage(msg map[string]interface{}) {
 
 						// Create candle from WebSocket data
 						if candle, err := types.NewCandleFromRaw(candleStrings); err == nil && s.onCandleUpdate != nil {
+							// Проверяем, является ли свеча нулевой
+							if candle.Close == 0 || candle.Volume == 0 {
+								s.mu.Lock()
+								s.zeroCandleCount++
+								log.Printf("⚠️ Zero candle #%d подряд", s.zeroCandleCount)
+								if s.zeroCandleCount >= 5 {
+									log.Printf("🔄 5 zero-candle подряд – перезапускаем WebSocket")
+									s.zeroCandleCount = 0
+									s.mu.Unlock()
+									go s.handleReconnection() // не блокируем обработку
+									return
+								}
+								s.mu.Unlock()
+								return
+							}
+							// Сброс счётчика при появлении нормальной свечи
+							s.mu.Lock()
+							s.zeroCandleCount = 0
+							s.mu.Unlock()
+							
 							s.onCandleUpdate(candle)
 						}
 					}
@@ -248,16 +270,26 @@ func (s *OKXMarketDataService) handlePing() {
 	}
 }
 
-// sendPing sends a ping message
+// sendPing sends a keep-alive subscription message
 func (s *OKXMarketDataService) sendPing() {
 	s.mu.RLock()
-	if !s.connected {
+	if !s.connected || s.conn == nil {
 		s.mu.RUnlock()
 		return
 	}
+	instId := strings.ToUpper(s.instrumentID)
 	s.mu.RUnlock()
 
-	// Note: OKX WebSocket doesn't require explicit ping, connection is kept alive automatically
+	// Переподписываемся на ту же свечу — OKX считает это активностью
+	ping := map[string]interface{}{
+		"op": "subscribe",
+		"args": []map[string]interface{}{
+			{"channel": "candle" + strings.ToLower(s.timeframe), "instId": instId},
+		},
+	}
+	if err := s.conn.WriteJSON(ping); err != nil {
+		log.Printf("❌ keep-alive send error: %v", err)
+	}
 }
 
 // handleReconnection handles reconnection logic

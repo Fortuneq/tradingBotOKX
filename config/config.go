@@ -15,12 +15,17 @@ type OKXConfig struct {
 }
 
 type StrategyConfig struct {
+	RSILength       int     `json:"RSILength"`
+	ATRLength       int     `json:"ATRLength"`
 	RiskPercent     float64 `json:"RiskPercent"`
 	RewardRatio     float64 `json:"RewardRatio"`
-	RSILength       int     `json:"RsiLength"`
-	ATRLength       int     `json:"AtrLength"`
-	UseTrailingStop bool    `json:"UseTrailingStop"`
 	TrailingPercent float64 `json:"TrailingPercent"`
+	UseTrailingStop bool    `json:"UseTrailingStop"`
+	RsiOverbought   float64 `json:"RsiOverbought"`
+	RsiOversold     float64 `json:"RsiOversold"`
+	CooldownBars    int     `json:"CooldownBars"`
+	AllInMode       bool    `json:"AllInMode"`   // новый флаг
+	OrderType       string  `json:"OrderType"`   // тип ордера: "market" или "limit"
 }
 
 type Config struct {

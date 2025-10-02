@@ -1,6 +1,7 @@
 package types
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
@@ -70,7 +71,39 @@ type OrderInfo struct {
 	Price      float64     `json:"px,string"`
 	Size       float64     `json:"sz,string"`
 	Status     OrderStatus `json:"state"`
-	CreateTime time.Time   `json:"cTime,string"`
+	CreateTime int64       `json:"-"`
+}
+
+// Custom unmarshaling to handle Unix timestamp in milliseconds
+func (o *OrderInfo) UnmarshalJSON(data []byte) error {
+	// Define an alias to avoid recursion during unmarshaling
+	type Alias OrderInfo
+	aux := &struct {
+		CreateTime string `json:"cTime"`
+		*Alias
+	}{
+		Alias: (*Alias)(o),
+	}
+
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	// Parse the timestamp string to int64
+	if aux.CreateTime != "" {
+		timestamp, err := strconv.ParseInt(aux.CreateTime, 10, 64)
+		if err != nil {
+			return err
+		}
+		o.CreateTime = timestamp
+	}
+
+	return nil
+}
+
+// GetCreateTime converts the Unix timestamp to time.Time
+func (o *OrderInfo) GetCreateTime() time.Time {
+	return time.Unix(0, o.CreateTime*int64(time.Millisecond))
 }
 
 // PositionInfo represents position information
@@ -83,11 +116,27 @@ type PositionInfo struct {
 	UPL      float64   `json:"upl,string"`
 }
 
+// BalanceDetail represents balance details for a specific currency
+type BalanceDetail struct {
+	Currency   string  `json:"ccy"`
+	Equity     float64 `json:"eq,string"`
+	Availablebal float64 `json:"availBal,string"`
+}
+
 // BalanceInfo represents balance information
 type BalanceInfo struct {
-	Currency     string  `json:"ccy"`
-	Equity       float64 `json:"eq,string"`
-	Availablebal float64 `json:"availBal,string"`
+	Currency     string          `json:"ccy"`
+	Equity       float64         `json:"eq,string"`
+	Availablebal float64         `json:"availBal,string"`
+	Details      []BalanceDetail `json:"details"`
+}
+
+// OrderBook represents order book information
+type OrderBook struct {
+	InstID string      `json:"instId"`
+	Bids   [][]string  `json:"bids"` // [price, size, count, ...]
+	Asks   [][]string  `json:"asks"` // [price, size, count, ...]
+	Ts     string      `json:"ts"`
 }
 
 // TickerInfo represents ticker information
@@ -138,9 +187,9 @@ func NewCandleFromRaw(raw []string) (*Candle, error) {
 	}, nil
 }
 
-// IsCompleted checks if the candle is completed (more than 1 minute old)
+// IsCompleted checks if the candle is completed (more than 1 minute old for 1m timeframe)
 func (c *Candle) IsCompleted() bool {
-	return c.Timestamp.Add(time.Minute).Before(time.Now().UTC())
+	return c.Timestamp.Add(1 * time.Minute).Before(time.Now().UTC())
 }
 
 // TradeSignal represents a trading signal

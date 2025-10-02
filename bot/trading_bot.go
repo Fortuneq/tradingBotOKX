@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 
@@ -60,6 +61,7 @@ func NewTradingBot(cfg *config.Config) (*TradingBot, error) {
 		marketDataService,
 		restClient,
 		&cfg.Strategy,
+		cfg.OKX.InstrumentID,
 		500, // buffer size
 	)
 
@@ -104,15 +106,16 @@ func (bot *TradingBot) Start(ctx context.Context) error {
 	}
 
 	// Start periodic candle polling (every 5 seconds)
-	bot.candlePoller = time.NewTicker(5 * time.Second)
-	go bot.pollCandles()
+	// Commented out since WebSocket already provides candle updates
+	// bot.candlePoller = time.NewTicker(5 * time.Second)
+	// go bot.pollCandles()
 
 	// Start trailing stop updates (every 1 second)
 	bot.trailingTimer = time.NewTicker(1 * time.Second)
 	go bot.updateTrailingStopsOnExchange()
 
-	log.Printf("✅ Trading Bot started for %s (SPOT)", bot.config.OKX.InstrumentID)
-	log.Printf("📊 Real-time %s candles via WebSocket + polling every 5 seconds", bot.config.OKX.Timeframe)
+	log.Printf("✅ Trading Bot started for %s (Futures)", bot.config.OKX.InstrumentID)
+	log.Printf("📊 Real-time %s candles via WebSocket", bot.config.OKX.Timeframe)
 	log.Println("🔄 Trailing stops updated every 1 second")
 
 	return nil
@@ -164,12 +167,92 @@ func (bot *TradingBot) PlaceManualOrder(side types.OrderSide, size float64) (boo
 		return false, fmt.Errorf("invalid price: %f", ticker.Last)
 	}
 
+	// Determine order type based on configuration
+	orderType := bot.config.Strategy.OrderType
+	if orderType == "" {
+		orderType = "market" // default to market if not specified
+	}
+	
+	// Check for low liquidity by attempting to get order book
+	orderBook, err := bot.restClient.GetOrderBook(bot.config.OKX.InstrumentID, 1) // Get top of book
+	lowLiquidity := err != nil || len(orderBook.Asks) == 0 || len(orderBook.Bids) == 0
+	
+	// If order book is empty or error occurred, it's low liquidity situation
+	if lowLiquidity && orderType == "limit" {
+		log.Printf("⚠️ Low liquidity detected - switching to market order for %s", side)
+		orderType = "market" // Force market order when liquidity is low
+	}
+	
+	// Calculate limit price if order type is limit
+	var price *float64 = nil
+	if orderType == "limit" {
+		// Get order book to determine best available prices
+		if err != nil || len(orderBook.Asks) == 0 || len(orderBook.Bids) == 0 {
+			log.Printf("⚠️ Could not get order book, using calculated price: %v", err)
+			// Fallback: calculate limit price depending on order side for immediate fill:
+			// - For buy orders: place slightly above market to get filled immediately
+			// - For sell orders: place slightly below market to get filled immediately
+			limitPrice := ticker.Last
+			if side == types.OrderSideBuy {
+				// For buy orders, place slightly above current market to be filled immediately
+				limitPrice = ticker.Last * 1.001 // 0.1% above market
+			} else {
+				// For sell orders, place slightly below current market to be filled immediately
+				limitPrice = ticker.Last * 0.999 // 0.1% below market
+			}
+			price = &limitPrice
+		} else {
+			// Use prices from the order book
+			if side == types.OrderSideBuy {
+				// For buy orders, use the best ask price (lowest sell price) 
+				askPriceStr := orderBook.Asks[0][0] // First element is price
+				askPrice, err := strconv.ParseFloat(askPriceStr, 64)
+				if err != nil {
+					log.Printf("⚠️ Could not parse ask price, using calculated price: %v", err)
+					limitPrice := ticker.Last * 1.001
+					price = &limitPrice
+				} else {
+					// Place slightly above the best ask to ensure execution
+					limitPrice := askPrice * 1.0005 // 0.05% above best ask
+					price = &limitPrice
+				}
+			} else {
+				// For sell orders, use the best bid price (highest buy price)
+				bidPriceStr := orderBook.Bids[0][0] // First element is price
+				bidPrice, err := strconv.ParseFloat(bidPriceStr, 64)
+				if err != nil {
+					log.Printf("⚠️ Could not parse bid price, using calculated price: %v", err)
+					limitPrice := ticker.Last * 0.999
+					price = &limitPrice
+				} else {
+					// Place slightly below the best bid to ensure execution
+					limitPrice := bidPrice * 0.9995 // 0.05% below best bid
+					price = &limitPrice
+				}
+			}
+		}
+		
+		// Проверяем минимальный номинал для лимитных ордеров
+		// OKX требует минимальный номинал ~20 USDT для лимитных ордеров на фьючерсах
+		minNotional := 20.0 // OKX лимит для QTUM-USDT-SWAP
+		notional := size * *price // номинал = размер * цена
+		
+		if notional < minNotional {
+			log.Printf("⚠️  Лимитный номинал %.2f < %.2f USDT – переключаемся на рыночный", notional, minNotional)
+			orderType = "market" // переключаемся на рыночный ордер
+			price = nil // у рыночного ордера цена не указывается
+		} else {
+			log.Printf("📊 Manual limit price calculated: %.4f for %s order (nominal: %.2f USDT)", *price, side, notional)
+		}
+	}
+	
 	order := &types.OrderRequest{
 		InstID:    bot.config.OKX.InstrumentID,
-		TdMode:    "cash", // Spot trading mode
+		TdMode:    "cross", // Cross margin mode for futures trading
 		Side:      side,
-		OrderType: "market",
+		OrderType: orderType,
 		Size:      size,
+		Price:     price,
 	}
 
 	response, err := bot.restClient.PlaceOrder(order)
@@ -225,6 +308,13 @@ func (bot *TradingBot) onPriceUpdate(price float64) {
 
 // onCandleUpdate handles real-time candle updates from WebSocket
 func (bot *TradingBot) onCandleUpdate(candle *types.Candle) {
+	// Skip if the candle has zero values (malformed or temporary data)
+	if candle.Close == 0 || candle.Volume == 0 {
+		log.Printf("⚠️ Received zero candle, skipping: O:%.2f H:%.2f L:%.2f C:%.2f V:%.1f",
+			candle.Open, candle.High, candle.Low, candle.Close, candle.Volume)
+		return
+	}
+
 	// Update price from candle close
 	bot.priceMu.Lock()
 	bot.lastPrice = candle.Close
@@ -257,6 +347,9 @@ func (bot *TradingBot) onTradeSignal(signal *types.TradeSignal) error {
 	return nil
 }
 
+// WebSocketSilentTimeout определяет максимальное время ожидания новой свечи через WebSocket
+const WebSocketSilentTimeout = 6 * time.Minute
+
 // pollCandles periodically fetches and processes new candle data
 func (bot *TradingBot) pollCandles() {
 	defer func() {
@@ -270,7 +363,15 @@ func (bot *TradingBot) pollCandles() {
 		case <-bot.ctx.Done():
 			return
 		case <-bot.candlePoller.C:
-			bot.fetchAndProcessCandles()
+			// если последняя свеча старше 6 мин – берём из REST (это означает, что WebSocket действительно сломался)
+			bot.priceMu.RLock()
+			last := bot.lastCandleTime
+			bot.priceMu.RUnlock()
+
+			if time.Since(last) > WebSocketSilentTimeout {
+				log.Printf("⏳ WebSocket тихо > %v – запрашиваем свечу по REST", WebSocketSilentTimeout)
+				bot.fetchAndProcessCandles()
+			}
 		}
 	}
 }
@@ -403,4 +504,17 @@ func (bot *TradingBot) GetLastPrice() float64 {
 	bot.priceMu.RLock()
 	defer bot.priceMu.RUnlock()
 	return bot.lastPrice
+}
+
+// IsAllInMode returns whether AllInMode is enabled
+func (bot *TradingBot) IsAllInMode() bool {
+	return bot.config.Strategy.AllInMode
+}
+
+// EnterAllIn executes an all-in order based on configuration
+func (bot *TradingBot) EnterAllIn(side types.OrderSide) error {
+	if !bot.config.Strategy.AllInMode {
+		return fmt.Errorf("AllInMode disabled")
+	}
+	return bot.tradingStrategy.EnterAllIn(side)
 }

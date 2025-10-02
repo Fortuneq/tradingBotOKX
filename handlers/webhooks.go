@@ -37,11 +37,13 @@ func (h *WebhookHandlers) SetupRoutes(router *mux.Router) {
 
 	// Manual trading endpoints
 	router.HandleFunc("/manual-trade", h.handleManualTrade).Methods("POST")
+	router.HandleFunc("/all-in", h.handleAllInTrade).Methods("POST")
 
 	log.Println("🎯 Webhook endpoint: http://localhost:5000/tv-signal")
 	log.Println("📊 Status endpoint: http://localhost:5000/status")
 	log.Println("📈 Positions endpoint: http://localhost:5000/positions")
 	log.Println("🔧 Manual trade endpoint: http://localhost:5000/manual-trade")
+	log.Println("💥 All-in trade endpoint: http://localhost:5000/all-in")
 }
 
 // handleTradingViewSignal handles incoming TradingView webhook signals
@@ -180,7 +182,19 @@ func (h *WebhookHandlers) handleManualTrade(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Place the order
-	success, err := h.bot.PlaceManualOrder(side, request.Size)
+	var success bool
+	var err error
+	if h.bot.IsAllInMode() {
+		// Игнорируем присланный размер, если включен AllInMode
+		err = h.bot.EnterAllIn(side)
+		if err != nil {
+			success = false
+		} else {
+			success = true
+		}
+	} else {
+		success, err = h.bot.PlaceManualOrder(side, request.Size)
+	}
 	if err != nil {
 		log.Printf("❌ Manual trade failed: %v", err)
 		h.sendErrorResponse(w, http.StatusInternalServerError, "Trade execution failed")
@@ -197,6 +211,46 @@ func (h *WebhookHandlers) handleManualTrade(w http.ResponseWriter, r *http.Reque
 	} else {
 		h.sendErrorResponse(w, http.StatusBadRequest, "Trade execution failed")
 	}
+}
+
+// handleAllInTrade handles all-in trade requests
+func (h *WebhookHandlers) handleAllInTrade(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Side string  `json:"side"`
+		Size float64 `json:"size"`  // включаем на всякий случай, но не используем
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		log.Printf("❌ Invalid all-in trade request: %v", err)
+		h.sendErrorResponse(w, http.StatusBadRequest, "Invalid request format")
+		return
+	}
+
+	// Convert side to OrderSide
+	var side types.OrderSide
+	switch strings.ToLower(request.Side) {
+	case "buy":
+		side = types.OrderSideBuy
+	case "sell":
+		side = types.OrderSideSell
+	default:
+		h.sendErrorResponse(w, http.StatusBadRequest, "Invalid order side")
+		return
+	}
+
+	// Execute all-in trade
+	err := h.bot.EnterAllIn(side)
+	if err != nil {
+		log.Printf("❌ All-in trade failed: %v", err)
+		h.sendErrorResponse(w, http.StatusInternalServerError, "All-in trade execution failed")
+		return
+	}
+
+	h.sendJSONResponse(w, http.StatusOK, map[string]interface{}{
+		"status":  "success",
+		"message": "All-in trade executed successfully",
+		"side":    side,
+	})
 }
 
 // sendJSONResponse sends a JSON response
