@@ -64,9 +64,9 @@ type AdvancedTradingStrategy struct {
 	trailingPercent    float64
 
 	// RSI state tracking
-	prevRSI        float64  // значение RSI на предыдущей свече
-	prevCrossOver  bool     // уже было пересечение вверх (чтоб не дублировать)
-	prevCrossUnder bool     // уже было пересечение вниз (чтоб не дублировать)
+	prevRSI        float64 // значение RSI на предыдущей свече
+	prevCrossOver  bool    // уже было пересечение вверх (чтоб не дублировать)
+	prevCrossUnder bool    // уже было пересечение вниз (чтоб не дублировать)
 
 	// Event handlers
 	onTradeSignal func(*types.TradeSignal) error
@@ -147,7 +147,7 @@ func (s *AdvancedTradingStrategy) Initialize(ctx context.Context) error {
 	}
 
 	log.Printf("📊 Loaded %d historical candles", s.candleBuffer.Size())
-	
+
 	// Check for any existing positions on the exchange
 	log.Println("🔍 Checking for existing positions on exchange...")
 	positions, err := s.restClient.GetPositions("SWAP")
@@ -168,16 +168,16 @@ func (s *AdvancedTradingStrategy) Initialize(ctx context.Context) error {
 					Status:     types.PositionStatusOpen,
 					OpenTime:   time.Now(),
 				}
-				
+
 				s.positionsMu.Lock()
 				s.activePositions[internalPos.ID] = internalPos
 				s.positionsMu.Unlock()
-				
+
 				log.Printf("📌 Added exchange position to internal state")
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -195,9 +195,9 @@ func (s *AdvancedTradingStrategy) Update(candle *types.Candle) {
 		s.prevRSI = 0 // Reset RSI state
 		return
 	}
-	
+
 	s.currentPrice = candle.Close
-	
+
 	// Still add to buffer for indicator calculations
 	s.candleBuffer.PushBack(candle)
 
@@ -265,7 +265,7 @@ func (s *AdvancedTradingStrategy) Update(candle *types.Candle) {
 	s.checkStopConditions(candle.Close)
 	s.updateTrailingStops(candle.Close)
 	s.checkPositionTimeouts()
-	
+
 	// Check liquidation risk to prevent forced liquidation
 	s.checkLiquidationRisk(candle.Close)
 
@@ -276,14 +276,14 @@ func (s *AdvancedTradingStrategy) Update(candle *types.Candle) {
 		candleSlice := s.candleBuffer.ToSlice()
 		if len(candleSlice) >= 2 {
 			prevCandle := candleSlice[len(candleSlice)-2] // Previous completed candle
-			bearishRejection := prevCandle.Close > vwap // цена выше VWAP на предыдущей свече
-			bullishRejection := prevCandle.Close < vwap // цена ниже VWAP на предыдущей свече
+			bearishRejection := prevCandle.Close > vwap   // цена выше VWAP на предыдущей свече
+			bullishRejection := prevCandle.Close < vwap   // цена ниже VWAP на предыдущей свече
 
 			// Check if we can trade
 			canTrade := s.canTrade(prevCandle)
 
 			// Add debug logging to show indicator values
-			log.Printf("[STRATEGY] RSI=%.2f, VWAP=%.2f, ATR=%.4f | Conditions - RSI_Cross: %t, RSI_Crossunder: %t, Bullish(rej.): %t, Bearish(rej.): %t, CanTrade: %t", 
+			log.Printf("[STRATEGY] RSI=%.2f, VWAP=%.2f, ATR=%.4f | Conditions - RSI_Cross: %t, RSI_Crossunder: %t, Bullish(rej.): %t, Bearish(rej.): %t, CanTrade: %t",
 				currentRSI, vwap, atr, crossOver, crossUnder, bullishRejection, bearishRejection, canTrade)
 
 			// Generate signals only based on completed candle
@@ -291,13 +291,13 @@ func (s *AdvancedTradingStrategy) Update(candle *types.Candle) {
 				log.Printf("✅ LONG SIGNAL: RSI(%.2f) crossed up(%.2f), Bullish Rejection, Volume: %.2f", currentRSI, s.rsiOversold, prevCandle.Volume)
 				go s.GenerateSignal(types.OrderSideBuy, prevCandle, atr, vwap, "RSI+VWAP")
 				// Update last signal bar index
-				currentBarIndex := s.candleBuffer.Size() - 2   // ← -2  (previous COMPLETED bar)
+				currentBarIndex := s.candleBuffer.Size() - 2 // ← -2  (previous COMPLETED bar)
 				s.lastSignalBarIndex = &currentBarIndex
 			} else if canTrade && crossUnder && bearishRejection {
 				log.Printf("✅ SHORT SIGNAL: RSI(%.2f) crossed down(%.2f), Bearish Rejection, Volume: %.2f", currentRSI, s.rsiOverbought, prevCandle.Volume)
 				go s.GenerateSignal(types.OrderSideSell, prevCandle, atr, vwap, "RSI+VWAP")
 				// Update last signal bar index
-				currentBarIndex := s.candleBuffer.Size() - 2   // ← -2  (previous COMPLETED bar)
+				currentBarIndex := s.candleBuffer.Size() - 2 // ← -2  (previous COMPLETED bar)
 				s.lastSignalBarIndex = &currentBarIndex
 			}
 		}
@@ -310,7 +310,7 @@ func (s *AdvancedTradingStrategy) Update(candle *types.Candle) {
 // canTrade checks if trading conditions are met
 func (s *AdvancedTradingStrategy) canTrade(candle *types.Candle) bool {
 	log.Printf("🔍 Checking if can trade...")
-	
+
 	// Check cooldown
 	if s.lastSignalBarIndex != nil && s.candleBuffer.Size()-*s.lastSignalBarIndex <= s.cooldownBars {
 		log.Println("⏳ Cooldown period - cannot trade")
@@ -319,17 +319,35 @@ func (s *AdvancedTradingStrategy) canTrade(candle *types.Candle) bool {
 
 	// Check if we already have an active position
 	hasPosition := s.hasActivePosition()
-	log.Printf("🎯 Can trade: %t (Has internal active position: %t)", !hasPosition, hasPosition)
-	
-	return !hasPosition
+
+	// Дополнительная проверка: реальные позиции на бирже
+	positions, err := s.restClient.GetPositions("SWAP")
+	hasRealPosition := false
+	if err == nil {
+		for _, pos := range positions {
+			if pos.InstID == s.instrumentID && pos.Size > 0 {
+				log.Printf("🚫 Real position exists on exchange: %s (Size: %.4f)", pos.InstID, pos.Size)
+				hasRealPosition = true
+				break
+			}
+		}
+	} else {
+		log.Printf("⚠️ Failed to check real positions: %v", err)
+	}
+
+	canTradeResult := !hasPosition && !hasRealPosition
+	log.Printf("🎯 Can trade: %t (Has internal active position: %t, Has real position: %t)",
+		canTradeResult, hasPosition, hasRealPosition)
+
+	return canTradeResult
 }
 
-	// Check if position already exists for swap
+// Check if position already exists for swap
 
 // GenerateSignal generates a trading signal and executes the trade
 func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *types.Candle, atr, vwap float64, strategyName string) error {
 	log.Printf("🔄 Attempting to generate signal: %s", side)
-	
+
 	s.processingMu.Lock()
 	if s.isProcessingSignal {
 		log.Println("⚠️ Signal processing is already in progress - skipping")
@@ -346,7 +364,7 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 	}()
 
 	log.Println("🔍 Checking for existing positions...")
-	
+
 	// Set leverage before placing order to ensure proper margin mode
 	if !s.config.AllInMode {
 		leverage := 5 // Using 5x leverage which is appropriate for futures trading
@@ -361,7 +379,7 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 		log.Printf("📊 Setting leverage for %s to 1 in cross mode (AllInMode)", s.instrumentID)
 		_ = s.restClient.SetLeverage(s.instrumentID, "cross", 1, "")
 	}
-	
+
 	// Check if position already exists for swap
 	positions, err := s.restClient.GetPositions("SWAP") // Check only swap positions
 	if err != nil {
@@ -376,7 +394,7 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 	}
 
 	log.Println("💰 Calculating position size...")
-	
+
 	// Calculate position size - using 90% of balance with 0.5 USDT reserve for fees
 	balance, err := s.restClient.GetBalance("USDT")
 	if err != nil {
@@ -385,7 +403,7 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 	}
 
 	log.Printf("💵 Balance: Available=%.2f", balance.Availablebal)
-	
+
 	// Use RiskPercent of balance for position, keeping 0.5 USDT for fees
 	riskFraction := s.riskPercent / 100.0
 	maxSpend := balance.Availablebal*riskFraction - 0.5
@@ -409,7 +427,7 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 	// Check liquidity based on bid/ask spread and last price
 	// If liquidity is low (volume = 0), we should consider using market order to avoid "All operations failed" error
 	// The volume information is not directly in ticker, but we can use the presence of bid/ask prices as a proxy
-	
+
 	// For both long and short positions in perpetual swap, calculate size based on available balance
 	size = maxSpend / ticker.Last
 	log.Printf("📊 Pre-futures: maxSpend=%.2f, price=%.2f, size=%.4f", maxSpend, ticker.Last, size)
@@ -418,40 +436,40 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 	// For AllInMode use cross mode which has 0.1 minimum, otherwise 0.01
 	var minContract float64
 	if s.config.AllInMode {
-		minContract = 0.1  // Minimum for futures in cross mode
+		minContract = 0.1 // Minimum for futures in cross mode
 	} else {
 		minContract = 0.01 // Minimum for futures in other modes
 	}
-	
+
 	// 1. максимально возможный размер
 	maxSize := (balance.Availablebal*(s.riskPercent/100.0) - 0.5) / ticker.Last
 	log.Printf("📊 maxSize before rounding: %.4f", maxSize)
-	
+
 	// 2. округляем вниз до 0.1 с запасом 0.1$
-	size = math.Floor((maxSize - 0.1)*10) / 10   // ← -0.1$ запас
+	size = math.Floor((maxSize-0.1)*10) / 10 // ← -0.1$ запас
 	log.Printf("📊 size after rounding: %.4f", size)
-	
+
 	if size < 0.1 {
 		size = 0.1
 		log.Printf("📊 size set to minimum 0.1")
 	}
-	
+
 	if size < minContract {
 		size = minContract
 		log.Printf("📊 size set to minContract: %.4f", minContract)
 	}
-	
+
 	// 3. финальная стоимость
 	realCost := size * ticker.Last
 	log.Printf("📊 realCost: %.4f (size: %.4f * price: %.4f)", realCost, size, ticker.Last)
-	
+
 	// Проверяем, хватит ли денег
 	needUSDT := size*ticker.Last + 0.5 // 0.5 на комиссию
 	if needUSDT > balance.Availablebal {
 		log.Printf("❌ Недостаточно USDT: нужно %.2f, есть %.2f – пропускаем сигнал", needUSDT, balance.Availablebal)
-		return nil                       // не входим
+		return nil // не входим
 	}
-	
+
 	// ОТКЛЮЧАЕМ авто-увеличение размера до минимального номинала OKX
 	// minContr := 1.0                       // шаг лота для QTUM
 	// minNotional := 20.0                   // порог OKX для QTUM
@@ -460,7 +478,7 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 	// if notional < minNotional {
 	// 	size = math.Ceil(minNotional/ticker.Last/minContr) * minContr
 	// 	log.Printf("⚠️  Увеличили size до %.1f (номинал %.2f USDT) для соблюдения минимума OKX", size, size*ticker.Last)
-	// 	
+	//
 	// 	// Проверяем снова, хватит ли денег после увеличения размера
 	// 	needUSDT = size*ticker.Last + 0.5
 	// 	if needUSDT > balance.Availablebal {
@@ -468,10 +486,10 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 	// 		return nil                       // не входим
 	// 	}
 	// }
-	
+
 	// Проверим, что размер соответствует минимальным требованиям по номиналу для рыночного ордера
 	// (перемещено после определения orderType)
-	
+
 	// Ensure that we have enough USDT in the appropriate account before placing order
 	if s.config.AllInMode {
 		// For all-in mode using cross, ensure we have funds available
@@ -485,13 +503,13 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 				log.Printf("❌ balance check failed: %v", err)
 				return nil
 			}
-			if bal.Availablebal < realCost + 0.5 {
-				log.Printf("❌ Insufficient funds in unified account. Available: %.2f, Need: %.2f", bal.Availablebal, realCost + 0.5)
+			if bal.Availablebal < realCost+0.5 {
+				log.Printf("❌ Insufficient funds in unified account. Available: %.2f, Need: %.2f", bal.Availablebal, realCost+0.5)
 				return nil
 			}
 		} else {
-			if bal.Availablebal < realCost + 0.5 {
-				log.Printf("❌ Insufficient funds in cross margin account. Available: %.2f, Need: %.2f", bal.Availablebal, realCost + 0.5)
+			if bal.Availablebal < realCost+0.5 {
+				log.Printf("❌ Insufficient funds in cross margin account. Available: %.2f, Need: %.2f", bal.Availablebal, realCost+0.5)
 				return nil
 			}
 		}
@@ -510,23 +528,23 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 	if s.config.AllInMode {
 		tdMode = "cross" // cross mode for all-in without leverage (cash не работает с фьючерсами)
 	}
-	
+
 	// Determine order type based on configuration and liquidity
 	orderType := s.config.OrderType
 	if orderType == "" {
 		orderType = "market" // default to market if not specified
 	}
-	
+
 	// Check for low liquidity by attempting to get order book
 	orderBook, err := s.restClient.GetOrderBook(s.instrumentID, 1) // Get top of book
 	lowLiquidity := err != nil || len(orderBook.Asks) == 0 || len(orderBook.Bids) == 0
-	
+
 	// If order book is empty or error occurred, it's low liquidity situation
 	if lowLiquidity {
 		log.Printf("⚠️ Low liquidity detected - using market order to avoid 'All operations failed' error")
 		orderType = "market" // Force market order when liquidity is low
 	}
-	
+
 	var price *float64 = nil
 	if orderType == "limit" {
 		// Get order book to determine best available prices
@@ -547,7 +565,7 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 		} else {
 			// Use prices from the order book
 			if side == types.OrderSideBuy {
-				// For buy orders, use the best ask price (lowest sell price) 
+				// For buy orders, use the best ask price (lowest sell price)
 				askPriceStr := orderBook.Asks[0][0] // First element is price
 				askPrice, err := strconv.ParseFloat(askPriceStr, 64)
 				if err != nil {
@@ -574,19 +592,19 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 				}
 			}
 		}
-		
+
 		// Проверяем минимальный номинал для лимитных ордеров
 		// OKX требует минимальный номинал ~20 USDT для лимитных ордеров на фьючерсах
-		minNotional := 20.0 // OKX лимит для фьючерсных инструментов
+		minNotional := 20.0       // OKX лимит для фьючерсных инструментов
 		notional := size * *price // номинал = размер * цена
-		
+
 		if notional < minNotional {
 			log.Printf("⚠️  Лимитный номинал %.2f < %.2f USDT – переключаемся на рыночный", notional, minNotional)
 			orderType = "market" // переключаемся на рыночный ордер
-			price = nil // у рыночного ордера цена не указывается
+			price = nil          // у рыночного ордера цена не указывается
 		} else {
 			log.Printf("📊 Limit price calculated: %.4f for %s order (nominal: %.2f USDT)", *price, side, notional)
-			
+
 			// Дополнительная проверка: если номинал < 25 USD – force market, чтобы избежать "All operations failed"
 			// OKX может отклонить лимитные ордера даже с номиналом > 1 USD из-за широкого спреда или малого объёма
 			if notional < 25.0 {
@@ -596,7 +614,7 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 			}
 		}
 	}
-	
+
 	// Проверим, что размер соответствует минимальным требованиям по номиналу для рыночного ордера
 	minMarketNotional := 1.0 // минимальный номинал для рыночных ордеров OKX (обычно 1 USDT)
 	if orderType == "market" && realCost < minMarketNotional {
@@ -610,22 +628,22 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 		nominal := size * ticker.Last
 		if nominal < 55.0 {
 			minContract := 0.1 // используем минимальный размер контракта для фьючерсов
-			size = math.Ceil(55.0 / ticker.Last / minContract) * minContract
+			size = math.Ceil(55.0/ticker.Last/minContract) * minContract
 			realCost = size * ticker.Last
 			log.Printf("⚠  Nominal < 55 USD – increased size to %.4f (nominal: %.2f USDT)", size, realCost)
 		}
 	}
-	
+
 	order = &types.OrderRequest{
-		InstID:    s.instrumentID,  // futures contract
-		TdMode:    tdMode,           // cross mode for all-in, isolated otherwise
+		InstID:    s.instrumentID, // futures contract
+		TdMode:    tdMode,         // cross mode for all-in, isolated otherwise
 		Side:      side,
 		OrderType: orderType,
 		Size:      size,
 		Price:     price,
 	}
 
-	log.Printf("📊 Preparing to place order - Size: %.4f, Price: %v, Type: %s, Nominal: %.4f", 
+	log.Printf("📊 Preparing to place order - Size: %.4f, Price: %v, Type: %s, Nominal: %.4f",
 		size, price, orderType, size*ticker.Last)
 
 	orderResp, err := s.restClient.PlaceOrder(order)
@@ -637,7 +655,7 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 	if orderResp.Code != "0" {
 		log.Printf("❌ Order failed with code %s: %s", orderResp.Code, orderResp.Message)
 		// Попробуем получить больше информации о причине ошибки
-		log.Printf("📊 Order details - InstID: %s, Side: %s, Size: %.4f, Price: %v, Type: %s", 
+		log.Printf("📊 Order details - InstID: %s, Side: %s, Size: %.4f, Price: %v, Type: %s",
 			order.InstID, order.Side, order.Size, order.Price, order.OrderType)
 		return fmt.Errorf("order failed: %s", orderResp.Message)
 	}
@@ -670,7 +688,7 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 		log.Printf("❌ Order info still nil after timeout – aborting")
 		return nil
 	}
-	
+
 	if orderInfo.Status != types.OrderStatusFilled {
 		log.Printf("⚠️ Order not filled within timeout. Last status: %v", orderInfo.Status)
 		return nil
@@ -705,7 +723,7 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 	log.Printf("📌 Position stored. Active positions now: %d", len(s.activePositions))
 
 	// Update last signal bar index
-	currentBarIndex := s.candleBuffer.Size() - 1   // ← -1  (last COMPLETED bar)
+	currentBarIndex := s.candleBuffer.Size() - 1 // ← -1  (last COMPLETED bar)
 	s.lastSignalBarIndex = &currentBarIndex
 
 	return nil
@@ -743,7 +761,7 @@ func (s *AdvancedTradingStrategy) setupGuaranteedExit(side types.OrderSide, fill
 		log.Printf("⚠️ Guaranteed exit orders not set: %v", err)
 		log.Printf("❌ Algo order response: %+v", response)
 	} else {
-		log.Printf("✅ Guaranteed exit set - SL: %.4f, TP: %.4f", 
+		log.Printf("✅ Guaranteed exit set - SL: %.4f, TP: %.4f",
 			slPrice, tpPrice)
 	}
 }
@@ -781,7 +799,7 @@ func (s *AdvancedTradingStrategy) ensureCrossUSDT(need float64) error {
 			log.Printf("⚠️ Could not get funding balance: %v", err)
 			fundingBalance = 0
 		}
-		
+
 		transferAmt := need + 0.5 // Adding buffer
 		if transferAmt > fundingBalance {
 			transferAmt = fundingBalance // don't transfer more than available
@@ -807,7 +825,6 @@ func (s *AdvancedTradingStrategy) ensureCrossUSDT(need float64) error {
 	log.Printf("💸 Transfer %.4f USDT funding→cross", transferAmt)
 	return s.restClient.TransferToMargin("USDT", transferAmt)
 }
-
 
 // GetPositions returns all positions (active and closed)
 func (s *AdvancedTradingStrategy) GetPositions() []*types.Position {
@@ -862,9 +879,9 @@ func (e *AllInExecutor) EnterLongShort(ctx context.Context, side types.OrderSide
 	price := tick.Last
 
 	// 4. Размер контракта - используем все доступные средства с запасом
-	contractVal := 0.1 // минимальный размер для фьючерсов
-	maxSize := (avail - 0.6) / price // вычитаем 0.6 на комиссии и запас
-	size := math.Floor((maxSize - 0.1)/contractVal) * contractVal // округляем вниз до 0.1 с запасом 0.1$
+	contractVal := 0.1                                          // минимальный размер для фьючерсов
+	maxSize := (avail - 0.6) / price                            // вычитаем 0.6 на комиссии и запас
+	size := math.Floor((maxSize-0.1)/contractVal) * contractVal // округляем вниз до 0.1 с запасом 0.1$
 	if size < contractVal {
 		size = contractVal
 	}
@@ -872,13 +889,13 @@ func (e *AllInExecutor) EnterLongShort(ctx context.Context, side types.OrderSide
 	// Check for low liquidity by attempting to get order book
 	orderBook, err := e.rest.GetOrderBook(e.instID, 1) // Get top of book
 	lowLiquidity := err != nil || len(orderBook.Asks) == 0 || len(orderBook.Bids) == 0
-	
+
 	// If order book is empty or error occurred, it's low liquidity situation
 	if lowLiquidity && orderType == "limit" {
 		log.Printf("⚠️ Low liquidity detected - switching to market order for %s", side)
 		orderType = "market" // Force market order when liquidity is low
 	}
-	
+
 	// 5. Вычисляем цену для лимитного ордера, если тип ордера - limit
 	var pricePtr *float64 = nil
 	if orderType == "limit" {
@@ -900,7 +917,7 @@ func (e *AllInExecutor) EnterLongShort(ctx context.Context, side types.OrderSide
 		} else {
 			// Use prices from the order book
 			if side == types.OrderSideBuy {
-				// For buy orders, use the best ask price (lowest sell price) 
+				// For buy orders, use the best ask price (lowest sell price)
 				askPriceStr := orderBook.Asks[0][0] // First element is price
 				askPrice, err := strconv.ParseFloat(askPriceStr, 64)
 				if err != nil {
@@ -927,19 +944,19 @@ func (e *AllInExecutor) EnterLongShort(ctx context.Context, side types.OrderSide
 				}
 			}
 		}
-		
+
 		// Проверяем минимальный номинал для лимитных ордеров
 		// OKX требует минимальный номинал ~20 USDT для лимитных ордеров на фьючерсах
-		minNotional := 20.0 // OKX лимит для фьючерсных инструментов
+		minNotional := 20.0          // OKX лимит для фьючерсных инструментов
 		notional := size * *pricePtr // номинал = размер * цена
-		
+
 		if notional < minNotional {
 			log.Printf("⚠️  Лимитный номинал %.2f < %.2f USDT – переключаемся на рыночный", notional, minNotional)
 			orderType = "market" // переключаемся на рыночный ордер
-			pricePtr = nil // у рыночного ордера цена не указывается
+			pricePtr = nil       // у рыночного ордера цена не указывается
 		} else {
 			log.Printf("📊 Limit price calculated: %.4f for %s order (nominal: %.2f USDT)", *pricePtr, side, notional)
-			
+
 			// Дополнительная проверка: если номинал < 25 USD – force market, чтобы избежать "All operations failed"
 			// OKX может отклонить лимитные ордера даже с номиналом > 1 USD из-за широкого спреда или малого объёма
 			if notional < 25.0 {
@@ -949,13 +966,13 @@ func (e *AllInExecutor) EnterLongShort(ctx context.Context, side types.OrderSide
 			}
 		}
 	}
-	
+
 	// Если это рыночный ордер и номинал < 55 USD – увеличиваем размер до 55 USD
 	if orderType == "market" {
 		nominal := size * price
 		if nominal < 55.0 {
 			contractVal := 0.1 // минимальный размер контракта для фьючерсов
-			size = math.Ceil(55.0 / price / contractVal) * contractVal
+			size = math.Ceil(55.0/price/contractVal) * contractVal
 			log.Printf("⚠  Nominal < 55 USD – increased size to %.4f (nominal: %.2f USDT)", size, size*price)
 		}
 	}
@@ -963,7 +980,7 @@ func (e *AllInExecutor) EnterLongShort(ctx context.Context, side types.OrderSide
 	// Ордер в режиме «cross» с 1× плечом
 	order := &types.OrderRequest{
 		InstID:    e.instID,
-		TdMode:    "cross",        // ← не cash! для фьючерсов
+		TdMode:    "cross", // ← не cash! для фьючерсов
 		Side:      side,
 		OrderType: orderType,
 		Size:      size,
@@ -1129,9 +1146,9 @@ func (s *AdvancedTradingStrategy) closePositionImmediately(instID string, curren
 	// Закрываем позицию с типом ордера из конфигурации (по умолчанию market для быстрого закрытия)
 	var side types.OrderSide
 	if position.Side == "long" {
-		side = types.OrderSideSell  // Для закрытия лонга продаем
+		side = types.OrderSideSell // Для закрытия лонга продаем
 	} else {
-		side = types.OrderSideBuy   // Для закрытия шорта покупаем
+		side = types.OrderSideBuy // Для закрытия шорта покупаем
 	}
 
 	// Для закрытия при ликвидации всегда используем рыночный ордер для гарантированного исполнения
@@ -1170,6 +1187,12 @@ func (s *AdvancedTradingStrategy) closePosition(positionID string, position *typ
 
 	log.Printf("🚪 EXIT %s | Price=%.2f | Reason=%s | PnL=%.2f USDT",
 		positionID, closePrice, reason, pnl)
+
+	// СБРОСИТЬ трейлинг-стоп после закрытия позиции
+	if position.IsTrailingStop {
+		log.Printf("🔄 Resetting trailing stop after position closure")
+		position.IsTrailingStop = false
+	}
 
 	// Update position
 	now := time.Now()
