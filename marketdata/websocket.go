@@ -154,7 +154,7 @@ func (s *OKXMarketDataService) authenticate() error {
 
 // subscribe sends subscription message
 func (s *OKXMarketDataService) subscribe() error {
-	// Subscribe to both candle and ticker channels
+	// Subscribe to candle channel only (tickers channel is not supported for futures)
 	channel := "candle" + strings.ToLower(strings.TrimSpace(s.timeframe))
 	instId := strings.ToUpper(strings.TrimSpace(s.instrumentID))
 
@@ -163,10 +163,6 @@ func (s *OKXMarketDataService) subscribe() error {
 		"args": []map[string]interface{}{
 			{
 				"channel": channel,
-				"instId":  instId,
-			},
-			{
-				"channel": "tickers",
 				"instId":  instId,
 			},
 		},
@@ -209,18 +205,6 @@ func (s *OKXMarketDataService) processMessage(msg map[string]interface{}) {
 	// Handle data messages
 	if arg, ok := msg["arg"].(map[string]interface{}); ok {
 		if channel, ok := arg["channel"].(string); ok {
-			// Handle ticker data
-			if channel == "tickers" {
-				if data, ok := msg["data"].([]interface{}); ok && len(data) > 0 {
-					if tickerData, ok := data[0].(map[string]interface{}); ok {
-						if lastStr, ok := tickerData["last"].(string); ok {
-							if lastPrice, err := strconv.ParseFloat(lastStr, 64); err == nil && s.onPriceUpdate != nil {
-								s.onPriceUpdate(lastPrice)
-							}
-						}
-					}
-				}
-			}
 			// Handle candle data
 			if channel == "candle"+strings.ToLower(s.timeframe) {
 				if data, ok := msg["data"].([]interface{}); ok && len(data) > 0 {
@@ -252,6 +236,11 @@ func (s *OKXMarketDataService) processMessage(msg map[string]interface{}) {
 							s.mu.Lock()
 							s.zeroCandleCount = 0
 							s.mu.Unlock()
+
+							// Also trigger price update with the close price from the candle
+							if s.onPriceUpdate != nil {
+								s.onPriceUpdate(candle.Close)
+							}
 
 							s.onCandleUpdate(candle)
 						}

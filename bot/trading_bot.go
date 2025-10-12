@@ -16,7 +16,6 @@ import (
 	"okx-trading-bot/strategy"
 	"okx-trading-bot/types"
 )
-)
 
 // TradingBot orchestrates market data, strategy, and order execution
 type TradingBot struct {
@@ -63,7 +62,7 @@ func NewTradingBot(cfg *config.Config) (*TradingBot, error) {
 	)
 
 	// Create trading strategy
-	tradingStrategy := strategy.NewAdvancedTradingStrategy(
+	advancedStrategy := strategy.NewAdvancedTradingStrategy(
 		marketDataService,
 		restClient,
 		&cfg.Strategy,
@@ -73,17 +72,15 @@ func NewTradingBot(cfg *config.Config) (*TradingBot, error) {
 
 	// Create trailing stop manager
 	trailingConfig := &strategy.TrailingConfig{
-		Enabled:        cfg.Strategy.UseTrailingStop,
-		CallbackRatio:  cfg.Strategy.TrailingPercent / 100.0,
-		UpdateInterval: 1 * time.Second,
-		MinPriceChange: 0.01,
+		Enabled:       cfg.Strategy.UseTrailingStop,
+		CallbackRatio: cfg.Strategy.TrailingPercent / 100.0,
 	}
 
 	bot := &TradingBot{
 		config:            cfg,
 		marketDataService: marketDataService,
 		restClient:        restClient,
-		tradingStrategy:   tradingStrategy,
+		tradingStrategy:   advancedStrategy,
 		trailingManager:   strategy.NewTrailingStopManager(restClient, cfg.OKX.InstrumentID, trailingConfig),
 		lastCandleTime:    time.Time{},
 	}
@@ -91,10 +88,20 @@ func NewTradingBot(cfg *config.Config) (*TradingBot, error) {
 	// Set up event handlers
 	marketDataService.SetOnPriceUpdate(bot.onPriceUpdate)
 	marketDataService.SetOnCandleUpdate(bot.onCandleUpdate)
-	tradingStrategy.SetOnTradeSignal(bot.onTradeSignal)
+	advancedStrategy.SetOnTradeSignal(bot.onTradeSignal)
 
 	// Set the trailing manager on the strategy
-	tradingStrategy.SetTrailingManager(bot.trailingManager)
+	advancedStrategy.SetTrailingManager(bot.trailingManager)
+
+	// Get and set initial balance for fixed risk management
+	balance, err := restClient.GetBalance("USDT")
+	if err != nil {
+		log.Printf("⚠️ Could not get initial balance: %v", err)
+		// If we can't get the initial balance, we'll rely on the strategy to use current balance as fallback
+	} else {
+		advancedStrategy.SetInitialBalance(balance.Equity)
+		log.Printf("📊 Initial balance set to %.2f USDT for fixed risk management", balance.Equity)
+	}
 
 	return bot, nil
 }

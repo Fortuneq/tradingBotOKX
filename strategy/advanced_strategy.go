@@ -68,7 +68,16 @@ func (s *AdvancedTradingStrategy) enterWithSLTP(side types.OrderSide, candle *ty
         
         // Ограничиваем размер позиции по доступному балансу при 1x плече (кросс-маржа)
         maxContractSize := (bal.Availablebal * 0.9) / price // 90% баланса для надежности
-        riskUSD := bal.Availablebal * (s.config.RiskPercent / 100.0) // 60% от баланса
+        
+        // Используем фиксированный риск от начального баланса, если он задан, иначе - от текущего баланса
+        var riskUSD float64
+        if s.initialBalance > 0 {
+            // Используем фиксированный риск от начального баланса
+            riskUSD = s.initialBalance * (s.config.RiskPercent / 100.0)
+        } else {
+            // Используем риск от текущего баланса (старое поведение)
+            riskUSD = bal.Availablebal * (s.config.RiskPercent / 100.0)
+        }
         size = riskUSD / slDistance
         
         // Ограничиваем по максимальному доступному размеру
@@ -116,7 +125,16 @@ func (s *AdvancedTradingStrategy) enterWithSLTP(side types.OrderSide, candle *ty
                 if err != nil {
                     return fmt.Errorf("balance: %w", err)
                 }
-                maxContr := math.Floor(bal.Availablebal / price / 0.1) * 0.1 // 0.1 шаг
+                
+                // Если используется фиксированный начальный баланс, ограничиваем по соотношению к начальному балансу
+                var effectiveBalance float64
+                if s.initialBalance > 0 {
+                    effectiveBalance = s.initialBalance
+                } else {
+                    effectiveBalance = bal.Availablebal
+                }
+                
+                maxContr := math.Floor(effectiveBalance / price / 0.1) * 0.1 // 0.1 шаг
                 if size > maxContr {
                     size = maxContr
                 }
@@ -141,9 +159,19 @@ func (s *AdvancedTradingStrategy) enterWithSLTP(side types.OrderSide, candle *ty
                 return fmt.Errorf("balance: %w", err)
             }
             avail := bal.Availablebal
-            riskAmt := avail * 0.70 // 70 % счёта
+            
+            // Используем фиксированный риск от начального баланса, если он задан, иначе - от текущего баланса
+            var riskAmt float64
+            if s.initialBalance > 0 {
+                // Используем фиксированный риск от начального баланса
+                riskAmt = s.initialBalance * (s.config.RiskPercent / 100.0)
+            } else {
+                // Используем риск от текущего баланса (старое поведение)
+                riskAmt = avail * (s.config.RiskPercent / 100.0) 
+            }
+            
             if riskAmt <= 1.0 {
-                return fmt.Errorf("70 %% too small: %.2f", riskAmt)
+                return fmt.Errorf("risk amount too small: %.2f", riskAmt)
             }
 
             // 3. Размер контракта
@@ -155,56 +183,103 @@ func (s *AdvancedTradingStrategy) enterWithSLTP(side types.OrderSide, candle *ty
         }
 
         // 4. Цены SL / TP с правильным соотношением риск/вознаграждение
-    var slPrice, tpPrice float64
-
-    if s.config.DynamicATRMult {
-        // Динамический расчет через ATR
-        slDistance := atr * atrMult
-        if side == types.OrderSideBuy {
-            slPrice = price - slDistance
-            // TP = риск * 1.5 (соотношение 1:1.5)
-            tpPrice = price + (slDistance * 1.5)
-        } else {
-            slPrice = price + slDistance
-            tpPrice = price - (slDistance * 1.5)
-        }
-    } else if s.config.PineMode {
-        // Pine-режим: используем ATR с множителями из конфигурации
-        slPrice = s.atrStop(price, side, atr, s.config.ATRMultiplierSL)
+        // slPrice and tpPrice are already declared previously, don't redeclare them
         
-        // TP на основе ATR и желаемого соотношения
-        tpDistance := atr * s.config.ATRMultiplierTP
-        if side == types.OrderSideBuy {
-            tpPrice = price + tpDistance
-        } else {
-            tpPrice = price - tpDistance
-        }
-        
-        // Проверяем минимальное соотношение риск/вознаграждение 1:1.2
-        risk := math.Abs(price - slPrice)
-        reward := math.Abs(tpPrice - price)
-        
-        if reward/risk < 1.2 {
-            // Увеличиваем TP до минимального соотношения
+        if s.config.DynamicATRMult {
+            // Динамический расчет через ATR
+            slDistance := atr * atrMult
             if side == types.OrderSideBuy {
-                tpPrice = price + (risk * 1.2)
+                slPrice = price - slDistance
+                // TP = риск * 1.5 (соотношение 1:1.5)
+                tpPrice = price + (slDistance * 1.5)
             } else {
-                tpPrice = price - (risk * 1.2)
+                slPrice = price + slDistance
+                tpPrice = price - (slDistance * 1.5)
+            }
+        } else if s.config.PineMode {
+            // Pine-режим: используем ATR с множителями из конфигурации
+            log.Printf("DEBUG PineMode - ATR: %.5f, price: %.2f, side: %s", atr, price, side)
+            log.Printf("DEBUG PineMode - ATRMultiplierSL: %.2f, ATRMultiplierTP: %.2f", s.config.ATRMultiplierSL, s.config.ATRMultiplierTP)
+            
+            // Проверяем, что ATRMultiplierSL не равен 0, чтобы избежать ошибки "invalid ATR distance: 0.00000"
+            atrMultiplierSL := s.config.ATRMultiplierSL
+            atrMultiplierTP := s.config.ATRMultiplierTP
+            if atrMultiplierSL <= 0 {
+                log.Printf("⚠️ ATRMultiplierSL is %.2f, using fallback 0.5", atrMultiplierSL)
+                atrMultiplierSL = 0.5 // используем разумный fallback
+            }
+            if atrMultiplierTP <= 0 {
+                log.Printf("⚠️ ATRMultiplierTP is %.2f, using fallback 1.5", atrMultiplierTP)
+                atrMultiplierTP = 1.5 // используем разумный fallback
+            }
+            
+            slPrice = s.atrStop(price, side, atr, atrMultiplierSL)
+            log.Printf("DEBUG PineMode - after atrStop: slPrice = %.5f", slPrice)
+            
+            // TP на основе ATR и желаемого соотношения
+            tpDistance := atr * atrMultiplierTP
+            log.Printf("DEBUG PineMode - tpDistance: %.5f (atr: %.5f * multiplierTP: %.2f)", tpDistance, atr, atrMultiplierTP)
+            
+            if side == types.OrderSideBuy {
+                tpPrice = price + tpDistance
+            } else {
+                tpPrice = price - tpDistance
+            }
+            log.Printf("DEBUG PineMode - after tp calculation: tpPrice = %.5f", tpPrice)
+            
+            // Проверяем минимальное соотношение риск/вознаграждение 1:1.2
+            risk := math.Abs(price - slPrice)
+            reward := math.Abs(tpPrice - price)
+            log.Printf("DEBUG PineMode - risk: %.5f, reward: %.5f, ratio: %.2f", risk, reward, reward/risk)
+            
+            if reward/risk < 1.2 {
+                log.Printf("DEBUG PineMode - ratio < 1.2, adjusting TP")
+                // Увеличиваем TP до минимального соотношения
+                if side == types.OrderSideBuy {
+                    tpPrice = price + (risk * 1.2)
+                } else {
+                    tpPrice = price - (risk * 1.2)
+                }
+                log.Printf("DEBUG PineMode - after ratio adjustment: tpPrice = %.5f", tpPrice)
+            }
+            
+            // Дополнительная защита: убедимся, что цены SL и TP - корректные (не отрицательные и не нулевые)
+            log.Printf("DEBUG PineMode - before zero checks: slPrice=%.5f, tpPrice=%.5f", slPrice, tpPrice)
+            
+            if slPrice <= 0 {
+                log.Printf("⚠️ PineMode - slPrice is zero, using fallback")
+                if side == types.OrderSideBuy {
+                    slPrice = price * 0.98 // SL не должен быть слишком низким
+                } else {
+                    slPrice = price * 1.02 // SL не должен быть слишком высоким
+                }
+                slPrice = math.Round(slPrice*100) / 100
+            }
+            
+            if tpPrice <= 0 {
+                log.Printf("⚠️ PineMode - tpPrice is zero, using fallback")
+                if side == types.OrderSideBuy {
+                    tpPrice = price * 1.02 // TP должен быть выше цены для лонга
+                } else {
+                    tpPrice = price * 0.98 // TP должен быть ниже цены для шорта
+                }
+                tpPrice = math.Round(tpPrice*100) / 100
+            }
+            
+            log.Printf("DEBUG PineMode - after zero checks: slPrice=%.5f, tpPrice=%.5f", slPrice, tpPrice)
+        } else {
+            // Классический режим: процент от цены с правильным соотношением
+            riskPercent := 0.015 // 1.5% риск
+            rewardPercent := 0.023 // 2.3% вознаграждение (соотношение 1:1.5)
+            
+            if side == types.OrderSideBuy {
+                slPrice = price * (1 - riskPercent)
+                tpPrice = price * (1 + rewardPercent)
+            } else {
+                slPrice = price * (1 + riskPercent)
+                tpPrice = price * (1 - rewardPercent)
             }
         }
-    } else {
-        // Классический режим: процент от цены с правильным соотношением
-        riskPercent := 0.015 // 1.5% риск
-        rewardPercent := 0.023 // 2.3% вознаграждение (соотношение 1:1.5)
-        
-        if side == types.OrderSideBuy {
-            slPrice = price * (1 - riskPercent)
-            tpPrice = price * (1 + rewardPercent)
-        } else {
-            slPrice = price * (1 + riskPercent)
-            tpPrice = price * (1 - rewardPercent)
-        }
-    }
 
     // Округляем до шага цены (0.01 для SOL-USDT)
     slPrice = math.Round(slPrice*100) / 100
@@ -220,6 +295,30 @@ func (s *AdvancedTradingStrategy) enterWithSLTP(side types.OrderSide, candle *ty
         }
         slPrice = math.Round(slPrice*100) / 100
     }
+    
+    // Финальная защита от нулевых и некорректных значений SL/TP
+    if slPrice <= 0 {
+        if side == types.OrderSideBuy {
+            slPrice = price * 0.995  // 0.5% ниже для лонга
+        } else {
+            slPrice = price * 1.005  // 0.5% выше для шорта
+        }
+        slPrice = math.Round(slPrice*100) / 100
+        log.Printf("⚠️ Final fallback SL price: %.5f (entry: %.5f)", slPrice, price)
+    }
+    
+    if tpPrice <= 0 {
+        if side == types.OrderSideBuy {
+            tpPrice = price * 1.008  // 0.8% выше для лонга
+        } else {
+            tpPrice = price * 0.992  // 0.8% ниже для шорта
+        }
+        tpPrice = math.Round(tpPrice*100) / 100
+        log.Printf("⚠️ Final fallback TP price: %.5f (entry: %.5f)", tpPrice, price)
+    }
+    
+    // Добавляем лог для отладки - проверяем значения перед вычислением соотношения
+    log.Printf("DEBUG Before final logging: slPrice=%.5f, tpPrice=%.5f, price=%.5f", slPrice, tpPrice, price)
     }
 
     // Выводим информацию о динамическом расчете
@@ -228,6 +327,9 @@ func (s *AdvancedTradingStrategy) enterWithSLTP(side types.OrderSide, candle *ty
             atr, atrMult, candle.High-candle.Low, slDistance, size)
     }
 
+    // Добавляем дополнительный отладочный лог перед вычислением risk/reward
+    log.Printf("DEBUG Right before risk/reward calculation: slPrice=%.5f, tpPrice=%.5f, price=%.5f", slPrice, tpPrice, price)
+    
     // Добавляем логирование соотношения риск/вознаграждение
     risk := math.Abs(price - slPrice)
     reward := math.Abs(tpPrice - price)
@@ -252,6 +354,16 @@ func (s *AdvancedTradingStrategy) enterWithSLTP(side types.OrderSide, candle *ty
         price, slPrice, tpPrice, side, closePos)
     log.Printf("DEBUG used block: DynamicATRMult=%v  PineMode=%v  atr=%.5f", 
         s.config.DynamicATRMult, s.config.PineMode, atr)
+    
+    // Проверяем, что SL и TP цены не равны нулю (иначе OKX отклонит ордер)
+    if slPrice <= 0 {
+        log.Printf("⚠️ Invalid SL price: %.5f (entry: %.5f, ATR: %.5f) — skipping order", slPrice, price, atr)
+        return fmt.Errorf("invalid SL price: %.5f", slPrice)
+    }
+    if tpPrice <= 0 {
+        log.Printf("⚠️ Invalid TP price: %.5f (entry: %.5f, ATR: %.5f) — skipping order", tpPrice, price, atr)
+        return fmt.Errorf("invalid TP price: %.5f", tpPrice)
+    }
     
     // 6. Формируем attach-algo (SL и TP)
     attach := []types.AttachAlgoOrd{
@@ -370,6 +482,7 @@ func (s *AdvancedTradingStrategy) enterWithSLTP(side types.OrderSide, candle *ty
     // Increment daily trade counter
     if s.trailingManager != nil {
         if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
+            _ = mgr // Use the variable to avoid "declared and not used" error
             // Call the increment function through the manager 
             // This would require adding an increment function to the manager
         }
@@ -384,7 +497,23 @@ func (s *AdvancedTradingStrategy) enterWithSLTP(side types.OrderSide, candle *ty
 
 // atrStop возвращает цену стоп-лосса/тейк-профита на основе ATR
 func (s *AdvancedTradingStrategy) atrStop(entryPx float64, side types.OrderSide, atr float64, multiplier float64) float64 {
+	// Защита от нулевых или отрицательных значений
+	log.Printf("DEBUG atrStop - entryPx: %.5f, atr: %.5f, multiplier: %.2f", entryPx, atr, multiplier)
+	
+	if atr <= 0 || multiplier <= 0 {
+		log.Printf("⚠️ ATR(%.5f) or multiplier(%.2f) is zero, using fallback", atr, multiplier)
+		// Используем разумные fallback-значения
+		if atr <= 0 {
+			atr = entryPx * 0.005  // 0.5% от цены как fallback для ATR
+		}
+		if multiplier <= 0 {
+			multiplier = 0.5  // 0.5 как fallback для множителя
+		}
+	}
+	
 	distance := atr * multiplier
+	log.Printf("DEBUG atrStop - distance: %.5f (atr: %.5f * multiplier: %.2f)", distance, atr, multiplier)
+	
 	var stopPx float64
 	switch side {
 	case types.OrderSideBuy:
@@ -392,8 +521,29 @@ func (s *AdvancedTradingStrategy) atrStop(entryPx float64, side types.OrderSide,
 	case types.OrderSideSell:
 		stopPx = entryPx + distance
 	}
+	
+	log.Printf("DEBUG atrStop - before rounding: stopPx = %.5f (entryPx: %.5f, distance: %.5f)", stopPx, entryPx, distance)
+	
 	// округляем до шага тика 0.01 (для большинства USDT-пар)
-	return math.Round(stopPx*100) / 100
+	stopPx = math.Round(stopPx*100) / 100
+	
+	log.Printf("DEBUG atrStop - after rounding: stopPx = %.5f", stopPx)
+	
+	// Проверяем, чтобы цена не была отрицательной или нулевой
+	if stopPx <= 0 {
+		log.Printf("⚠️ atrStop result is zero or negative: %.5f, using fallback", stopPx)
+		if side == types.OrderSideBuy {
+			// Для лонга SL не должен быть слишком низким
+			stopPx = entryPx * 0.98 // 2% от цены входа как минимальный SL
+		} else {
+			// Для шорта SL не должен быть слишком высоким
+			stopPx = entryPx * 1.02 // 2% от цены входа как минимальный SL
+		}
+		stopPx = math.Round(stopPx*100) / 100
+		log.Printf("DEBUG atrStop - after fallback: stopPx = %.5f", stopPx)
+	}
+	
+	return stopPx
 }
 type TradingStrategy interface {
 	Initialize(ctx context.Context) error
@@ -455,6 +605,9 @@ type AdvancedTradingStrategy struct {
 
 	// Reference to the trailing manager
 	trailingManager interface{} // TrailingStopManager interface
+
+	// Fixed risk management
+	initialBalance float64 // начальный баланс для фиксированного риска
 }
 
 // NewAdvancedTradingStrategy creates a new advanced trading strategy
@@ -529,7 +682,9 @@ func (s *AdvancedTradingStrategy) syncPositionsFromExchange() error {
 		// Отменяем все трейлинги
 		for _, pos := range s.activePositions {
 			if pos.StopLossAlgoID != "" {
-				_ = s.trailingManager.CancelExecutedTrailing(pos)
+				if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
+					_ = mgr.CancelExecutedTrailing(pos)
+				}
 			}
 		}
 		s.activePositions = make(map[string]*types.Position)
@@ -1137,6 +1292,11 @@ func (s *AdvancedTradingStrategy) GetPositions() []*types.Position {
 // SetTrailingManager sets the trailing manager for the strategy
 func (s *AdvancedTradingStrategy) SetTrailingManager(manager interface{}) {
 	s.trailingManager = manager
+}
+
+// SetInitialBalance sets the initial balance for fixed risk management
+func (s *AdvancedTradingStrategy) SetInitialBalance(balance float64) {
+	s.initialBalance = balance
 }
 
 // EnterAllIn implements the all-in entry method
@@ -1760,7 +1920,9 @@ func (s *AdvancedTradingStrategy) closePositionImmediately(instID string, curren
 func (s *AdvancedTradingStrategy) closePosition(positionID string, position *types.Position, closePrice float64, reason string) {
 	// Отменяем трейлинг при закрытии
 	if position.StopLossAlgoID != "" {
-		_ = s.trailingManager.CancelExecutedTrailing(position)
+		if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
+			_ = mgr.CancelExecutedTrailing(position)
+		}
 	}
 
 	// Быстрый расчет P&L
