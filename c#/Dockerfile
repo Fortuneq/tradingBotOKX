@@ -11,7 +11,7 @@ COPY ["*.csproj", "./"]
 RUN dotnet restore
 
 # Copy the rest of the application code
-COPY . .
+COPY .. .
 RUN dotnet build -c Release -o /app/build
 
 FROM build AS publish
