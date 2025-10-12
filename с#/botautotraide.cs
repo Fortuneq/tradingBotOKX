@@ -175,7 +175,7 @@ namespace OKXTraderBot
         private const string WebSocketUri =
             "wss://ws.okx.com:8443/ws/v5/public";
         private const int PingIntervalSec = 25;     // Интервал ping-сообщений
-        private const int ReconnectDelayMs = 5000;  // Задержка переподключения
+        private const int ReconnectDelayMs = 5500;  // Задержка переподключения
         private const int MaxRetries = 5;           // Максимальное количество попыток
 
         private readonly string _instrumentId;       // Инструмент (напр. BTC-USDT)

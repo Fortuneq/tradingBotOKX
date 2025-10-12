@@ -113,7 +113,7 @@ var atr = trueRanges.Average();
 1. **Подключение к OKX API** с использованием ключей из `appsettings.json`
 2. **Загрузка исторических данных** (500 свечей 30m) для инициализации индикаторов
 3. **Подписка на WebSocket** для получения реальных цен SOL-USDT
-4. **Запуск веб-сервера** на порту 5000 для приема webhook'ов
+4. **Запуск веб-сервера** на порту 5500 для приема webhook'ов
 
 ### Торговый цикл
 
@@ -131,7 +131,7 @@ var atr = trueRanges.Average();
 
 Бот поддерживает webhook'и от TradingView:
 
-**Endpoint**: `POST http://localhost:5000/tv-signal`
+**Endpoint**: `POST http://localhost:5500/tv-signal`
 
 **Формат**:
 ```json
@@ -144,9 +144,9 @@ var atr = trueRanges.Average();
 
 ### Мониторинг
 
-- **Status endpoint**: `GET http://localhost:5000/status`
+- **Status endpoint**: `GET http://localhost:5500/status`
 - **Логи в консоли**: Все торговые действия и ошибки
-- **Ping endpoint**: `GET http://localhost:5000/ping`
+- **Ping endpoint**: `GET http://localhost:5500/ping`
 
 ## ⚙️ Настройка
 

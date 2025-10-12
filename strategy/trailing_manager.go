@@ -37,7 +37,7 @@ func NewTrailingStopManager(
 }
 
 // InitializeTrailingForPosition creates a trailing stop for a given position
-func (tm *TrailingStopManager) InitializeTrailingForPosition(pos *types.Position, entryPrice float64) error {
+func (tm *TrailingStopManager) InitializeTrailingForPosition(pos *types.Position, entryPrice, stopLossPrice float64) error {
 	if !tm.config.Enabled || tm.config.CallbackRatio <= 0 {
 		return nil
 	}
@@ -47,15 +47,20 @@ func (tm *TrailingStopManager) InitializeTrailingForPosition(pos *types.Position
 	var closeSide types.OrderSide
 
 	if pos.Side == types.OrderSideBuy {
-		activationPx = entryPrice // For long positions, track from entry price as peak
+		// For long positions, start trailing from stop loss price (below entry)
+		activationPx = stopLossPrice
 		closeSide = types.OrderSideSell
 	} else {
-		activationPx = entryPrice // For short positions, track from entry price as peak
+		// For short positions, start trailing from stop loss price (above entry)
+		activationPx = stopLossPrice
 		closeSide = types.OrderSideBuy
 	}
 
 	callbackRatio := tm.config.CallbackRatio
 	tdMode := "cross" // Default to cross mode
+
+	log.Printf("🎯 Trailing Stop Setup: Entry=%.2f, SL=%.2f, Activation=%.2f, Callback=%.3f%%",
+		entryPrice, stopLossPrice, activationPx, callbackRatio*100)
 
 	// Create the trailing stop order on exchange
 	resp, err := tm.restClient.PlaceTrailingStop(
@@ -97,12 +102,12 @@ func (tm *TrailingStopManager) CancelExecutedTrailing(pos *types.Position) error
 		pos.StopLossAlgoID = "" // Очищаем ID
 		return nil
 	}
-	
+
 	if err == nil {
 		log.Printf("✅ Cancelled trailing stop: %s", pos.StopLossAlgoID)
 		pos.StopLossAlgoID = ""
 	}
-	
+
 	return err
 }
 

@@ -39,11 +39,11 @@ func (h *WebhookHandlers) SetupRoutes(router *mux.Router) {
 	router.HandleFunc("/manual-trade", h.handleManualTrade).Methods("POST")
 	router.HandleFunc("/all-in", h.handleAllInTrade).Methods("POST")
 
-	log.Println("🎯 Webhook endpoint: http://localhost:5000/tv-signal")
-	log.Println("📊 Status endpoint: http://localhost:5000/status")
-	log.Println("📈 Positions endpoint: http://localhost:5000/positions")
-	log.Println("🔧 Manual trade endpoint: http://localhost:5000/manual-trade")
-	log.Println("💥 All-in trade endpoint: http://localhost:5000/all-in")
+	log.Println("🎯 Webhook endpoint: http://localhost:5500/tv-signal")
+	log.Println("📊 Status endpoint: http://localhost:5500/status")
+	log.Println("📈 Positions endpoint: http://localhost:5500/positions")
+	log.Println("🔧 Manual trade endpoint: http://localhost:5500/manual-trade")
+	log.Println("💥 All-in trade endpoint: http://localhost:5500/all-in")
 }
 
 // handleTradingViewSignal handles incoming TradingView webhook signals

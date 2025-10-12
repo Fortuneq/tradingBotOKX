@@ -166,7 +166,7 @@ REST API для внешних интеграций:
 
 ### Webhook от TradingView
 ```bash
-POST http://localhost:5000/tv-signal
+POST http://localhost:5500/tv-signal
 Content-Type: application/json
 
 {
@@ -178,17 +178,17 @@ Content-Type: application/json
 
 ### Статус бота
 ```bash
-GET http://localhost:5000/status
+GET http://localhost:5500/status
 ```
 
 ### Позиции
 ```bash
-GET http://localhost:5000/positions
+GET http://localhost:5500/positions
 ```
 
 ### Ручная торговля
 ```bash
-POST http://localhost:5000/manual-trade
+POST http://localhost:5500/manual-trade
 Content-Type: application/json
 
 {
@@ -269,7 +269,7 @@ CMD ["./trading-bot"]
 
 ```bash
 docker build -t okx-trading-bot .
-docker run -d -p 5000:5000 okx-trading-bot
+docker run -d -p 5500:5500 okx-trading-bot
 ```
 
 ## 📈 Monitoring
@@ -334,7 +334,7 @@ signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 go run main.go -v
 
 # Профилирование
-go tool pprof http://localhost:5000/debug/pprof/profile
+go tool pprof http://localhost:5500/debug/pprof/profile
 
 # Race detection
 go run -race main.go

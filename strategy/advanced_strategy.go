@@ -18,479 +18,485 @@ import (
 
 // enterWithSLTP входит на 70 % баланса и сразу вешает SL/TP через attach-algo
 func (s *AdvancedTradingStrategy) enterWithSLTP(side types.OrderSide, candle *types.Candle, atr float64) error {
-    log.Printf("🔍 enterWithSLTP: started, side=%s, atr=%.4f, candle=(H:%.4f, L:%.4f, C:%.4f)", 
-        side, atr, candle.High, candle.Low, candle.Close)
-    
-    // 1. Текущая цена
-    ticker, err := s.restClient.GetTicker(s.instrumentID)
-    if err != nil {
-        log.Printf("❌ GetTicker error: %v", err)
-        return fmt.Errorf("ticker: %w", err)
-    }
-    price := ticker.Last
+	log.Printf("🔍 enterWithSLTP: started, side=%s, atr=%.4f, candle=(H:%.4f, L:%.4f, C:%.4f)",
+		side, atr, candle.High, candle.Low, candle.Close)
 
-    // 2. Вычисление динамического ATR-множителя
-    var atrMult float64
-    var slDistance, slPrice, tpPrice float64
-    var size float64
+	// 1. Текущая цена
+	ticker, err := s.restClient.GetTicker(s.instrumentID)
+	if err != nil {
+		log.Printf("❌ GetTicker error: %v", err)
+		return fmt.Errorf("ticker: %w", err)
+	}
+	price := ticker.Last
 
-    if s.config.DynamicATRMult {
-        // Динамический ATR-множитель на основе диапазона свечи
-        range30m := candle.High - candle.Low
-        atrMult = 0.5 + (range30m/price)*100 // 0.5-3.0
-        if atrMult < s.config.MinATRMult {
-            atrMult = s.config.MinATRMult
-        }
-        if atrMult > s.config.MaxATRMult {
-            atrMult = s.config.MaxATRMult
-        }
-        
-        // Динамический SL/TP
-        slDistance = atr * atrMult // динамический стоп
-        if side == types.OrderSideBuy {
-            slPrice = price - slDistance
-        } else {
-            slPrice = price + slDistance // для шорта
-        }
-        
-        // TP = SL * 1.5
-        if side == types.OrderSideBuy {
-            tpPrice = price + slDistance*1.5
-        } else {
-            tpPrice = price - slDistance*1.5 // для шорта
-        }
-        
-        // Размер позиции на основе риска и расстояния до SL
-        bal, err := s.restClient.GetBalance("USDT")
-        if err != nil {
-            return fmt.Errorf("balance: %w", err)
-        }
-        
-        // Ограничиваем размер позиции по доступному балансу при 1x плече (кросс-маржа)
-        maxContractSize := (bal.Availablebal * 0.9) / price // 90% баланса для надежности
-        
-        // Используем фиксированный риск от начального баланса, если он задан, иначе - от текущего баланса
-        var riskUSD float64
-        if s.initialBalance > 0 {
-            // Используем фиксированный риск от начального баланса
-            riskUSD = s.initialBalance * (s.config.RiskPercent / 100.0)
-        } else {
-            // Используем риск от текущего баланса (старое поведение)
-            riskUSD = bal.Availablebal * (s.config.RiskPercent / 100.0)
-        }
-        size = riskUSD / slDistance
-        
-        // Ограничиваем по максимальному доступному размеру
-        if size > maxContractSize {
-            size = maxContractSize
-        }
-        
-        if size < 0.1 {
-            return fmt.Errorf("not enough USDT for 1× cross nominal (need %.2f, have %.2f)",
-                size*price, bal.Availablebal)
-        }
-        
-        // === Округление до шага 0.1 (OKX lot-size) ===
-        size = math.Round(size*10) / 10
-        if size < 0.1 {
-            size = 0.1
-        }
-        if size > 1000 { // максимум 1000 контрактов
-            size = 1000
-        }
-    } else {
-        // Традиционный расчет
-        if s.config.PineMode {
-            // Проверяем, что ATRMultiplierSL не равен 0, чтобы избежать ошибки "invalid ATR distance: 0.000000"
-            atrMultiplier := s.config.ATRMultiplierSL
-            if atrMultiplier <= 0 {
-                log.Printf("⚠️ ATRMultiplierSL is %.2f, using fallback 0.5", atrMultiplier)
-                atrMultiplier = 0.5 // используем разумный fallback
-            }
-            
-            size, err = PinePositionSize(s.restClient, s.instrumentID,
-                s.config.EquityPercent, atr, atrMultiplier)
-            if err != nil {
-                log.Printf("⚠️ PinePositionSize error: %v, using fallback 0.1 size", err)
-                size = 0.1  // минимальный размер контракта
-                
-                // Также проверим, что ATR не равен 0, иначе используем разумный fallback
-                if atr <= 0 {
-                    log.Printf("⚠️ ATR is zero, using fallback 0.2 for calculations")
-                    atr = 0.2
-                }
-            } else {
-                // 2. Ограничиваем размер контракта доступным балансом в cross-режиме 1×
-                bal, err := s.restClient.GetBalance("USDT")
-                if err != nil {
-                    return fmt.Errorf("balance: %w", err)
-                }
-                
-                // Если используется фиксированный начальный баланс, ограничиваем по соотношению к начальному балансу
-                var effectiveBalance float64
-                if s.initialBalance > 0 {
-                    effectiveBalance = s.initialBalance
-                } else {
-                    effectiveBalance = bal.Availablebal
-                }
-                
-                maxContr := math.Floor(effectiveBalance / price / 0.1) * 0.1 // 0.1 шаг
-                if size > maxContr {
-                    size = maxContr
-                }
-                if size < 0.1 {
-                    return fmt.Errorf("not enough USDT for 1× cross nominal (need %.2f, have %.2f)",
-                        size*price, bal.Availablebal)
-                }
-            }
-            
-            // === Округление до шага 0.1 (OKX lot-size) ===
-            size = math.Round(size*10) / 10
-            if size < 0.1 {
-                size = 0.1
-            }
-            if size > 1000 { // максимум 1000 контрактов
-                size = 1000
-            }
-        } else {
-            // 2. Доступный USDT (Unified / Cross)
-            bal, err := s.restClient.GetBalance("USDT")
-            if err != nil {
-                return fmt.Errorf("balance: %w", err)
-            }
-            avail := bal.Availablebal
-            
-            // Используем фиксированный риск от начального баланса, если он задан, иначе - от текущего баланса
-            var riskAmt float64
-            if s.initialBalance > 0 {
-                // Используем фиксированный риск от начального баланса
-                riskAmt = s.initialBalance * (s.config.RiskPercent / 100.0)
-            } else {
-                // Используем риск от текущего баланса (старое поведение)
-                riskAmt = avail * (s.config.RiskPercent / 100.0) 
-            }
-            
-            if riskAmt <= 1.0 {
-                return fmt.Errorf("risk amount too small: %.2f", riskAmt)
-            }
+	// 2. Вычисление динамического ATR-множителя
+	var atrMult float64
+	var slDistance, slPrice, tpPrice float64
+	var size float64
 
-            // 3. Размер контракта
-            contractVal := 0.1 // минимальный шаг OKX для SWAP
-            size = math.Floor((riskAmt/price)/contractVal) * contractVal
-            if size < contractVal {
-                size = contractVal
-            }
-        }
+	if s.config.DynamicATRMult {
+		// Динамический ATR-множитель на основе диапазона свечи
+		range30m := candle.High - candle.Low
+		atrMult = 0.5 + (range30m/price)*100 // 0.5-3.0
+		if atrMult < s.config.MinATRMult {
+			atrMult = s.config.MinATRMult
+		}
+		if atrMult > s.config.MaxATRMult {
+			atrMult = s.config.MaxATRMult
+		}
 
-        // 4. Цены SL / TP с правильным соотношением риск/вознаграждение
-        // slPrice and tpPrice are already declared previously, don't redeclare them
-        
-        if s.config.DynamicATRMult {
-            // Динамический расчет через ATR
-            slDistance := atr * atrMult
-            if side == types.OrderSideBuy {
-                slPrice = price - slDistance
-                // TP = риск * 1.5 (соотношение 1:1.5)
-                tpPrice = price + (slDistance * 1.5)
-            } else {
-                slPrice = price + slDistance
-                tpPrice = price - (slDistance * 1.5)
-            }
-        } else if s.config.PineMode {
-            // Pine-режим: используем ATR с множителями из конфигурации
-            log.Printf("DEBUG PineMode - ATR: %.5f, price: %.2f, side: %s", atr, price, side)
-            log.Printf("DEBUG PineMode - ATRMultiplierSL: %.2f, ATRMultiplierTP: %.2f", s.config.ATRMultiplierSL, s.config.ATRMultiplierTP)
-            
-            // Проверяем, что ATRMultiplierSL не равен 0, чтобы избежать ошибки "invalid ATR distance: 0.00000"
-            atrMultiplierSL := s.config.ATRMultiplierSL
-            atrMultiplierTP := s.config.ATRMultiplierTP
-            if atrMultiplierSL <= 0 {
-                log.Printf("⚠️ ATRMultiplierSL is %.2f, using fallback 0.5", atrMultiplierSL)
-                atrMultiplierSL = 0.5 // используем разумный fallback
-            }
-            if atrMultiplierTP <= 0 {
-                log.Printf("⚠️ ATRMultiplierTP is %.2f, using fallback 1.5", atrMultiplierTP)
-                atrMultiplierTP = 1.5 // используем разумный fallback
-            }
-            
-            slPrice = s.atrStop(price, side, atr, atrMultiplierSL)
-            log.Printf("DEBUG PineMode - after atrStop: slPrice = %.5f", slPrice)
-            
-            // TP на основе ATR и желаемого соотношения
-            tpDistance := atr * atrMultiplierTP
-            log.Printf("DEBUG PineMode - tpDistance: %.5f (atr: %.5f * multiplierTP: %.2f)", tpDistance, atr, atrMultiplierTP)
-            
-            if side == types.OrderSideBuy {
-                tpPrice = price + tpDistance
-            } else {
-                tpPrice = price - tpDistance
-            }
-            log.Printf("DEBUG PineMode - after tp calculation: tpPrice = %.5f", tpPrice)
-            
-            // Проверяем минимальное соотношение риск/вознаграждение 1:1.2
-            risk := math.Abs(price - slPrice)
-            reward := math.Abs(tpPrice - price)
-            log.Printf("DEBUG PineMode - risk: %.5f, reward: %.5f, ratio: %.2f", risk, reward, reward/risk)
-            
-            if reward/risk < 1.2 {
-                log.Printf("DEBUG PineMode - ratio < 1.2, adjusting TP")
-                // Увеличиваем TP до минимального соотношения
-                if side == types.OrderSideBuy {
-                    tpPrice = price + (risk * 1.2)
-                } else {
-                    tpPrice = price - (risk * 1.2)
-                }
-                log.Printf("DEBUG PineMode - after ratio adjustment: tpPrice = %.5f", tpPrice)
-            }
-            
-            // Дополнительная защита: убедимся, что цены SL и TP - корректные (не отрицательные и не нулевые)
-            log.Printf("DEBUG PineMode - before zero checks: slPrice=%.5f, tpPrice=%.5f", slPrice, tpPrice)
-            
-            if slPrice <= 0 {
-                log.Printf("⚠️ PineMode - slPrice is zero, using fallback")
-                if side == types.OrderSideBuy {
-                    slPrice = price * 0.98 // SL не должен быть слишком низким
-                } else {
-                    slPrice = price * 1.02 // SL не должен быть слишком высоким
-                }
-                slPrice = math.Round(slPrice*100) / 100
-            }
-            
-            if tpPrice <= 0 {
-                log.Printf("⚠️ PineMode - tpPrice is zero, using fallback")
-                if side == types.OrderSideBuy {
-                    tpPrice = price * 1.02 // TP должен быть выше цены для лонга
-                } else {
-                    tpPrice = price * 0.98 // TP должен быть ниже цены для шорта
-                }
-                tpPrice = math.Round(tpPrice*100) / 100
-            }
-            
-            log.Printf("DEBUG PineMode - after zero checks: slPrice=%.5f, tpPrice=%.5f", slPrice, tpPrice)
-        } else {
-            // Классический режим: процент от цены с правильным соотношением
-            riskPercent := 0.015 // 1.5% риск
-            rewardPercent := 0.023 // 2.3% вознаграждение (соотношение 1:1.5)
-            
-            if side == types.OrderSideBuy {
-                slPrice = price * (1 - riskPercent)
-                tpPrice = price * (1 + rewardPercent)
-            } else {
-                slPrice = price * (1 + riskPercent)
-                tpPrice = price * (1 - rewardPercent)
-            }
-        }
+		// Динамический SL/TP
+		slDistance = atr * atrMult // динамический стоп
+		if side == types.OrderSideBuy {
+			slPrice = price - slDistance
+		} else {
+			slPrice = price + slDistance // для шорта
+		}
 
-    // Округляем до шага цены (0.01 для SOL-USDT)
-    slPrice = math.Round(slPrice*100) / 100
-    tpPrice = math.Round(tpPrice*100) / 100
+		// TP = SL * 1.5
+		if side == types.OrderSideBuy {
+			tpPrice = price + slDistance*1.5
+		} else {
+			tpPrice = price - slDistance*1.5 // для шорта
+		}
 
-    // Проверяем минимальное расстояние для SL (не менее 0.3% от цены входа)
-    minSLDistance := price * 0.003 // 0.3%
-    if math.Abs(price-slPrice) < minSLDistance {
-        if side == types.OrderSideBuy {
-            slPrice = price - minSLDistance
-        } else {
-            slPrice = price + minSLDistance
-        }
-        slPrice = math.Round(slPrice*100) / 100
-    }
-    
-    // Финальная защита от нулевых и некорректных значений SL/TP
-    if slPrice <= 0 {
-        if side == types.OrderSideBuy {
-            slPrice = price * 0.995  // 0.5% ниже для лонга
-        } else {
-            slPrice = price * 1.005  // 0.5% выше для шорта
-        }
-        slPrice = math.Round(slPrice*100) / 100
-        log.Printf("⚠️ Final fallback SL price: %.5f (entry: %.5f)", slPrice, price)
-    }
-    
-    if tpPrice <= 0 {
-        if side == types.OrderSideBuy {
-            tpPrice = price * 1.008  // 0.8% выше для лонга
-        } else {
-            tpPrice = price * 0.992  // 0.8% ниже для шорта
-        }
-        tpPrice = math.Round(tpPrice*100) / 100
-        log.Printf("⚠️ Final fallback TP price: %.5f (entry: %.5f)", tpPrice, price)
-    }
-    
-    // Добавляем лог для отладки - проверяем значения перед вычислением соотношения
-    log.Printf("DEBUG Before final logging: slPrice=%.5f, tpPrice=%.5f, price=%.5f", slPrice, tpPrice, price)
-    }
+		// Размер позиции на основе риска и расстояния до SL
+		bal, err := s.restClient.GetBalance("USDT")
+		if err != nil {
+			return fmt.Errorf("balance: %w", err)
+		}
 
-    // Выводим информацию о динамическом расчете
-    if s.config.DynamicATRMult {
-        log.Printf("📊 Dynamic ATR sizing: atr=%.4f, atrMult=%.3f, range30m=%.4f, slDistance=%.4f, size=%.3f", 
-            atr, atrMult, candle.High-candle.Low, slDistance, size)
-    }
+		// Ограничиваем размер позиции по доступному балансу при 1x плече (кросс-маржа)
+		maxContractSize := (bal.Availablebal * 0.9) / price // 90% баланса для надежности
 
-    // Добавляем дополнительный отладочный лог перед вычислением risk/reward
-    log.Printf("DEBUG Right before risk/reward calculation: slPrice=%.5f, tpPrice=%.5f, price=%.5f", slPrice, tpPrice, price)
-    
-    // Добавляем логирование соотношения риск/вознаграждение
-    risk := math.Abs(price - slPrice)
-    reward := math.Abs(tpPrice - price)
-    ratio := reward / risk
+		// Используем фиксированный риск от начального баланса, если он задан, иначе - от текущего баланса
+		var riskUSD float64
+		if s.initialBalance > 0 {
+			// Используем фиксированный риск от начального баланса
+			riskUSD = s.initialBalance * (s.config.RiskPercent / 100.0)
+		} else {
+			// Используем риск от текущего баланса (старое поведение)
+			riskUSD = bal.Availablebal * (s.config.RiskPercent / 100.0)
+		}
+		size = riskUSD / slDistance
 
-    log.Printf("📊 SL/TP calculated: Entry=%.2f, SL=%.2f (%.2f%%), TP=%.2f (%.2f%%), Ratio=1:%.1f",
-        price, slPrice, (risk/price)*100, tpPrice, (reward/price)*100, ratio)
+		// Ограничиваем по максимальному доступному размеру
+		if size > maxContractSize {
+			size = maxContractSize
+		}
 
-    // 5. Сторона закрытия
-    var closeSide types.OrderSide
-    var closePos string
-    if side == types.OrderSideBuy {
-        closeSide = types.OrderSideSell  // для закрытия лонга продаем
-        closePos = "long"
-    } else { // types.OrderSideSell
-        closeSide = types.OrderSideBuy   // для закрытия шорта покупаем
-        closePos = "short"
-    }
+		if size < 0.1 {
+			return fmt.Errorf("not enough USDT for 1× cross nominal (need %.2f, have %.2f)",
+				size*price, bal.Availablebal)
+		}
 
-    // 6. Debug logging for SL and TP
-    log.Printf("DEBUG attach SL and TP: entry=%.5f  slPrice=%.5f  tpPrice=%.5f  side=%s  closePos=%s", 
-        price, slPrice, tpPrice, side, closePos)
-    log.Printf("DEBUG used block: DynamicATRMult=%v  PineMode=%v  atr=%.5f", 
-        s.config.DynamicATRMult, s.config.PineMode, atr)
-    
-    // Проверяем, что SL и TP цены не равны нулю (иначе OKX отклонит ордер)
-    if slPrice <= 0 {
-        log.Printf("⚠️ Invalid SL price: %.5f (entry: %.5f, ATR: %.5f) — skipping order", slPrice, price, atr)
-        return fmt.Errorf("invalid SL price: %.5f", slPrice)
-    }
-    if tpPrice <= 0 {
-        log.Printf("⚠️ Invalid TP price: %.5f (entry: %.5f, ATR: %.5f) — skipping order", tpPrice, price, atr)
-        return fmt.Errorf("invalid TP price: %.5f", tpPrice)
-    }
-    
-    // 6. Формируем attach-algo (SL и TP)
-    attach := []types.AttachAlgoOrd{
-        {
-            OrdType:     "conditional",
-            Side:        closeSide,
-            PosSide:     closePos,
-            SlTriggerPx: slPrice,
-            SlOrdPx:     "-1",
-        },
-        {
-            OrdType:     "conditional",
-            Side:        closeSide,
-            PosSide:     closePos,
-            TpTriggerPx: tpPrice,
-            TpOrdPx:     "-1",
-        },
-    }
+		// === Округление до шага 0.1 (OKX lot-size) ===
+		size = math.Round(size*10) / 10
+		if size < 0.1 {
+			size = 0.1
+		}
+		if size > 1000 { // максимум 1000 контрактов
+			size = 1000
+		}
+	} else {
+		// Традиционный расчет
+		if s.config.PineMode {
+			// Проверяем, что ATRMultiplierSL не равен 0, чтобы избежать ошибки "invalid ATR distance: 0.000000"
+			atrMultiplier := s.config.ATRMultiplierSL
+			if atrMultiplier <= 0 {
+				log.Printf("⚠️ ATRMultiplierSL is %.2f, using fallback 0.5", atrMultiplier)
+				atrMultiplier = 0.5 // используем разумный fallback
+			}
 
-    // 7. Основной ордер
-    order := &types.OrderRequest{
-        InstID:         s.instrumentID,
-        TdMode:         "cross",      // !!! теперь cross
-        Side:           side,
-        PosSide:        closePos,     // для хедж-режима
-        OrderType:      "market",
-        Size:           size,
-        ClOrdID:        fmt.Sprintf("strat%d%04d", time.Now().Unix(), rand.Intn(10000)),
-        AttachAlgoOrds: attach,
-    }
+			size, err = PinePositionSize(s.restClient, s.instrumentID,
+				s.config.EquityPercent, atr, atrMultiplier)
+			if err != nil {
+				log.Printf("⚠️ PinePositionSize error: %v, using fallback 0.1 size", err)
+				size = 0.1 // минимальный размер контракта
 
-    resp, err := s.restClient.PlaceOrder(order)
-    if err != nil {
-        return fmt.Errorf("place order: %w", err)
-    }
-    if resp.Code != "0" {
-        return fmt.Errorf("order failed: %s", resp.Message)
-    }
+				// Также проверим, что ATR не равен 0, иначе используем разумный fallback
+				if atr <= 0 {
+					log.Printf("⚠️ ATR is zero, using fallback 0.2 for calculations")
+					atr = 0.2
+				}
+			} else {
+				// 2. Ограничиваем размер контракта доступным балансом в cross-режиме 1×
+				bal, err := s.restClient.GetBalance("USDT")
+				if err != nil {
+					return fmt.Errorf("balance: %w", err)
+				}
 
-    // 8. Ждём филла (коротко)
-    orderID := resp.Data[0].OrderID
-    var oi *types.OrderInfo
-    for i := 0; i < 20; i++ {
-        time.Sleep(500 * time.Millisecond)
-        oi, _ = s.restClient.GetOrderInfo(orderID, s.instrumentID)
-        if oi != nil && oi.Status == types.OrderStatusFilled {
-            break
-        }
-    }
-    if oi == nil || oi.Status != types.OrderStatusFilled {
-        return fmt.Errorf("order not filled")
-    }
+				// Если используется фиксированный начальный баланс, ограничиваем по соотношению к начальному балансу
+				var effectiveBalance float64
+				if s.initialBalance > 0 {
+					effectiveBalance = s.initialBalance
+				} else {
+					effectiveBalance = bal.Availablebal
+				}
 
-    // 9. Создаем позицию в памяти
-    pos := &types.Position{
-        ID:         fmt.Sprintf("%d", time.Now().UnixNano()),
-        Side:       side,
-        EntryPrice: oi.GetPrice(),
-        Size:       oi.Size,
-        StopLoss:   slPrice,
-        TakeProfit: tpPrice,
-        Status:     types.PositionStatusOpen,
-        OpenTime:   time.Now(),
-        OrderID:    orderID,
-        PeakPrice:  oi.GetPrice(), // Инициализируем PeakPrice как EntryPrice
-        EntryATR:   atr,          // ATR на момент входа
-        TrailOffset: atr * s.config.TrailATRMult,  // смещение для трейлинга
-    }
-    
-    // Extract algo order IDs from the response
-    if len(resp.Data) > 0 && len(resp.Data[0].AttachAlgoOrds) > 0 {
-        for _, algoOrd := range resp.Data[0].AttachAlgoOrds {
-            // Check if this is a stop loss order (has slTriggerPx)
-            if algoOrd.SlTriggerPx != nil {
-                pos.StopLossAlgoID = algoOrd.AlgoID
-                log.Printf("✅ Captured SL algo order ID: %s", pos.StopLossAlgoID)
-                break
-            }
-        }
-    }
-    
-    // Use the centralized trailing stop manager instead of creating directly
-    if s.config.UseTrailingStop && s.config.TrailingPercent > 0 {
-        log.Printf("DEBUG: Trailing stop config - UseTrailingStop=%v, TrailingPercent=%.3f", 
-            s.config.UseTrailingStop, s.config.TrailingPercent)
-        log.Printf("DEBUG: About to initialize trailing stop via manager - size=%.3f entry=%.5f", oi.Size, oi.GetPrice())
-        
-        // Initialize trailing stop through the manager
-        if s.trailingManager != nil {
-            // Using type assertion to call the manager method
-            if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
-                if err := mgr.InitializeTrailingForPosition(pos, oi.GetPrice()); err != nil {
-                    log.Printf("⚠️ Failed to initialize trailing stop via manager: %v", err)
-                    // Fallback: if manager fails, we can still use fixed SL
-                    pos.StopLoss = slPrice
-                } else {
-                    log.Printf("✅ Trailing stop managed by centralized manager for position %s", pos.ID)
-                }
-            } else {
-                log.Printf("⚠️ Trailing manager type assertion failed, using fallback SL: %.4f", slPrice)
-                pos.StopLoss = slPrice
-            }
-        } else {
-            log.Printf("⚠️ Trailing manager not available, using fallback SL: %.4f", slPrice)
-            pos.StopLoss = slPrice
-        }
-    } else {
-        log.Printf("ℹ️ Native trailing not set - condition not met: UseTrailingStop=%v, TrailingPercent=%.3f", 
-            s.config.UseTrailingStop, s.config.TrailingPercent)
-    }
+				maxContr := math.Floor(effectiveBalance/price/0.1) * 0.1 // 0.1 шаг
+				if size > maxContr {
+					size = maxContr
+				}
+				if size < 0.1 {
+					return fmt.Errorf("not enough USDT for 1× cross nominal (need %.2f, have %.2f)",
+						size*price, bal.Availablebal)
+				}
+			}
 
-    s.positionsMu.Lock()
-    s.activePositions[pos.ID] = pos
-    s.positionsMu.Unlock()
+			// === Округление до шага 0.1 (OKX lot-size) ===
+			size = math.Round(size*10) / 10
+			if size < 0.1 {
+				size = 0.1
+			}
+			if size > 1000 { // максимум 1000 контрактов
+				size = 1000
+			}
+		} else {
+			// 2. Доступный USDT (Unified / Cross)
+			bal, err := s.restClient.GetBalance("USDT")
+			if err != nil {
+				return fmt.Errorf("balance: %w", err)
+			}
+			avail := bal.Availablebal
 
-    // Increment daily trade counter
-    if s.trailingManager != nil {
-        if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
-            _ = mgr // Use the variable to avoid "declared and not used" error
-            // Call the increment function through the manager 
-            // This would require adding an increment function to the manager
-        }
-    }
+			// Используем фиксированный риск от начального баланса, если он задан, иначе - от текущего баланса
+			var riskAmt float64
+			if s.initialBalance > 0 {
+				// Используем фиксированный риск от начального баланса
+				riskAmt = s.initialBalance * (s.config.RiskPercent / 100.0)
+			} else {
+				// Используем риск от текущего баланса (старое поведение)
+				riskAmt = avail * (s.config.RiskPercent / 100.0)
+			}
 
-    log.Printf("✅ Entry %s %.3f @ %.2f  SL=%.2f  TP=%.2f",
-        side, oi.Size, oi.GetPrice(), slPrice, tpPrice)
-    return nil
+			if riskAmt <= 1.0 {
+				return fmt.Errorf("risk amount too small: %.2f", riskAmt)
+			}
+
+			// 3. Размер контракта
+			contractVal := 0.1 // минимальный шаг OKX для SWAP
+			size = math.Floor((riskAmt/price)/contractVal) * contractVal
+			if size < contractVal {
+				size = contractVal
+			}
+		}
+
+		// 4. Цены SL / TP с правильным соотношением риск/вознаграждение
+		// slPrice and tpPrice are already declared previously, don't redeclare them
+
+		if s.config.DynamicATRMult {
+			// Динамический расчет через ATR
+			slDistance := atr * atrMult
+			if side == types.OrderSideBuy {
+				slPrice = price - slDistance
+				// TP = риск * 1.5 (соотношение 1:1.5)
+				tpPrice = price + (slDistance * 1.5)
+			} else {
+				slPrice = price + slDistance
+				tpPrice = price - (slDistance * 1.5)
+			}
+		} else if s.config.PineMode {
+			// Pine-режим: используем ATR с множителями из конфигурации
+			log.Printf("DEBUG PineMode - ATR: %.5f, price: %.2f, side: %s", atr, price, side)
+			log.Printf("DEBUG PineMode - ATRMultiplierSL: %.2f, ATRMultiplierTP: %.2f", s.config.ATRMultiplierSL, s.config.ATRMultiplierTP)
+
+			// Проверяем, что ATRMultiplierSL не равен 0, чтобы избежать ошибки "invalid ATR distance: 0.00000"
+			atrMultiplierSL := s.config.ATRMultiplierSL
+			atrMultiplierTP := s.config.ATRMultiplierTP
+			if atrMultiplierSL <= 0 {
+				log.Printf("⚠️ ATRMultiplierSL is %.2f, using fallback 0.5", atrMultiplierSL)
+				atrMultiplierSL = 0.5 // используем разумный fallback
+			}
+			if atrMultiplierTP <= 0 {
+				log.Printf("⚠️ ATRMultiplierTP is %.2f, using fallback 1.5", atrMultiplierTP)
+				atrMultiplierTP = 1.5 // используем разумный fallback
+			}
+
+			slPrice = s.atrStop(price, side, atr, atrMultiplierSL)
+			log.Printf("DEBUG PineMode - after atrStop: slPrice = %.5f", slPrice)
+
+			// TP на основе ATR и желаемого соотношения
+			tpDistance := atr * atrMultiplierTP
+			log.Printf("DEBUG PineMode - tpDistance: %.5f (atr: %.5f * multiplierTP: %.2f)", tpDistance, atr, atrMultiplierTP)
+
+			if side == types.OrderSideBuy {
+				tpPrice = price + tpDistance
+			} else {
+				tpPrice = price - tpDistance
+			}
+			log.Printf("DEBUG PineMode - after tp calculation: tpPrice = %.5f", tpPrice)
+
+			// Проверяем минимальное соотношение риск/вознаграждение 1:1.2
+			risk := math.Abs(price - slPrice)
+			reward := math.Abs(tpPrice - price)
+			log.Printf("DEBUG PineMode - risk: %.5f, reward: %.5f, ratio: %.2f", risk, reward, reward/risk)
+
+			if reward/risk < 1.2 {
+				log.Printf("DEBUG PineMode - ratio < 1.2, adjusting TP")
+				// Увеличиваем TP до минимального соотношения
+				if side == types.OrderSideBuy {
+					tpPrice = price + (risk * 1.2)
+				} else {
+					tpPrice = price - (risk * 1.2)
+				}
+				log.Printf("DEBUG PineMode - after ratio adjustment: tpPrice = %.5f", tpPrice)
+			}
+
+			// Дополнительная защита: убедимся, что цены SL и TP - корректные (не отрицательные и не нулевые)
+			log.Printf("DEBUG PineMode - before zero checks: slPrice=%.5f, tpPrice=%.5f", slPrice, tpPrice)
+
+			if slPrice <= 0 {
+				log.Printf("⚠️ PineMode - slPrice is zero, using fallback")
+				if side == types.OrderSideBuy {
+					slPrice = price * 0.98 // SL не должен быть слишком низким
+				} else {
+					slPrice = price * 1.02 // SL не должен быть слишком высоким
+				}
+				slPrice = math.Round(slPrice*100) / 100
+			}
+
+			if tpPrice <= 0 {
+				log.Printf("⚠️ PineMode - tpPrice is zero, using fallback")
+				if side == types.OrderSideBuy {
+					tpPrice = price * 1.02 // TP должен быть выше цены для лонга
+				} else {
+					tpPrice = price * 0.98 // TP должен быть ниже цены для шорта
+				}
+				tpPrice = math.Round(tpPrice*100) / 100
+			}
+
+			log.Printf("DEBUG PineMode - after zero checks: slPrice=%.5f, tpPrice=%.5f", slPrice, tpPrice)
+		} else {
+			// Классический режим: процент от цены с правильным соотношением
+			riskPercent := 0.015   // 1.5% риск
+			rewardPercent := 0.023 // 2.3% вознаграждение (соотношение 1:1.5)
+
+			if side == types.OrderSideBuy {
+				slPrice = price * (1 - riskPercent)
+				tpPrice = price * (1 + rewardPercent)
+			} else {
+				slPrice = price * (1 + riskPercent)
+				tpPrice = price * (1 - rewardPercent)
+			}
+		}
+
+		// Округляем до шага цены (0.01 для SOL-USDT)
+		slPrice = math.Round(slPrice*100) / 100
+		tpPrice = math.Round(tpPrice*100) / 100
+
+		// Проверяем минимальное расстояние для SL (не менее 0.3% от цены входа)
+		minSLDistance := price * 0.003 // 0.3%
+		if math.Abs(price-slPrice) < minSLDistance {
+			if side == types.OrderSideBuy {
+				slPrice = price - minSLDistance
+			} else {
+				slPrice = price + minSLDistance
+			}
+			slPrice = math.Round(slPrice*100) / 100
+		}
+
+		// Финальная защита от нулевых и некорректных значений SL/TP
+		if slPrice <= 0 {
+			if side == types.OrderSideBuy {
+				slPrice = price * 0.995 // 0.5% ниже для лонга
+			} else {
+				slPrice = price * 1.005 // 0.5% выше для шорта
+			}
+			slPrice = math.Round(slPrice*100) / 100
+			log.Printf("⚠️ Final fallback SL price: %.5f (entry: %.5f)", slPrice, price)
+		}
+
+		if tpPrice <= 0 {
+			if side == types.OrderSideBuy {
+				tpPrice = price * 1.008 // 0.8% выше для лонга
+			} else {
+				tpPrice = price * 0.992 // 0.8% ниже для шорта
+			}
+			tpPrice = math.Round(tpPrice*100) / 100
+			log.Printf("⚠️ Final fallback TP price: %.5f (entry: %.5f)", tpPrice, price)
+		}
+
+		// Добавляем лог для отладки - проверяем значения перед вычислением соотношения
+		log.Printf("DEBUG Before final logging: slPrice=%.5f, tpPrice=%.5f, price=%.5f", slPrice, tpPrice, price)
+	}
+
+	// Выводим информацию о динамическом расчете
+	if s.config.DynamicATRMult {
+		log.Printf("📊 Dynamic ATR sizing: atr=%.4f, atrMult=%.3f, range30m=%.4f, slDistance=%.4f, size=%.3f",
+			atr, atrMult, candle.High-candle.Low, slDistance, size)
+	}
+
+	// Добавляем дополнительный отладочный лог перед вычислением risk/reward
+	log.Printf("DEBUG Right before risk/reward calculation: slPrice=%.5f, tpPrice=%.5f, price=%.5f", slPrice, tpPrice, price)
+
+	// Добавляем логирование соотношения риск/вознаграждение
+	risk := math.Abs(price - slPrice)
+	reward := math.Abs(tpPrice - price)
+	ratio := reward / risk
+
+	log.Printf("📊 SL/TP calculated: Entry=%.2f, SL=%.2f (%.2f%%), TP=%.2f (%.2f%%), Ratio=1:%.1f",
+		price, slPrice, (risk/price)*100, tpPrice, (reward/price)*100, ratio)
+
+	// 5. Сторона закрытия
+	var closeSide types.OrderSide
+	var closePos string
+	if side == types.OrderSideBuy {
+		closeSide = types.OrderSideSell // для закрытия лонга продаем
+		closePos = "long"
+	} else { // types.OrderSideSell
+		closeSide = types.OrderSideBuy // для закрытия шорта покупаем
+		closePos = "short"
+	}
+
+	// 6. Debug logging for SL and TP
+	log.Printf("DEBUG attach SL and TP: entry=%.5f  slPrice=%.5f  tpPrice=%.5f  side=%s  closePos=%s",
+		price, slPrice, tpPrice, side, closePos)
+	log.Printf("DEBUG used block: DynamicATRMult=%v  PineMode=%v  atr=%.5f",
+		s.config.DynamicATRMult, s.config.PineMode, atr)
+
+	// Проверяем, что SL и TP цены не равны нулю (иначе OKX отклонит ордер)
+	if slPrice <= 0 {
+		log.Printf("⚠️ Invalid SL price: %.5f (entry: %.5f, ATR: %.5f) — skipping order", slPrice, price, atr)
+		return fmt.Errorf("invalid SL price: %.5f", slPrice)
+	}
+	if tpPrice <= 0 {
+		log.Printf("⚠️ Invalid TP price: %.5f (entry: %.5f, ATR: %.5f) — skipping order", tpPrice, price, atr)
+		return fmt.Errorf("invalid TP price: %.5f", tpPrice)
+	}
+
+	// 6. Формируем attach-algo (SL и TP)
+	attach := []types.AttachAlgoOrd{
+		{
+			OrdType: "conditional",
+			Side:    closeSide,
+			// PosSide:     closePos,  // НЕ НУЖЕН в Net Mode!
+			SlTriggerPx: slPrice,
+			SlOrdPx:     "-1",
+		},
+		{
+			OrdType: "conditional",
+			Side:    closeSide,
+			// PosSide:     closePos,  // НЕ НУЖЕН в Net Mode!
+			TpTriggerPx: tpPrice,
+			TpOrdPx:     "-1",
+		},
+	}
+
+	// 7. Основной ордер
+	order := &types.OrderRequest{
+		InstID: s.instrumentID,
+		TdMode: "cross", // !!! теперь cross
+		Side:   side,
+		// PosSide:        closePos,     // НЕ НУЖЕН в Net Mode!
+		OrderType:      "market",
+		Size:           size,
+		ClOrdID:        fmt.Sprintf("strat%d%04d", time.Now().Unix(), rand.Intn(10000)),
+		AttachAlgoOrds: attach,
+	}
+
+	resp, err := s.restClient.PlaceOrder(order)
+	if err != nil {
+		return fmt.Errorf("place order: %w", err)
+	}
+	if resp.Code != "0" {
+		return fmt.Errorf("order failed: %s", resp.Message)
+	}
+
+	// 8. Ждём филла (коротко)
+	orderID := resp.Data[0].OrderID
+	var oi *types.OrderInfo
+	for i := 0; i < 20; i++ {
+		time.Sleep(500 * time.Millisecond)
+		oi, _ = s.restClient.GetOrderInfo(orderID, s.instrumentID)
+		if oi != nil && oi.Status == types.OrderStatusFilled {
+			break
+		}
+	}
+	if oi == nil || oi.Status != types.OrderStatusFilled {
+		return fmt.Errorf("order not filled")
+	}
+
+	// 9. Создаем позицию в памяти
+	pos := &types.Position{
+		ID:          fmt.Sprintf("%d", time.Now().UnixNano()),
+		Side:        side,
+		EntryPrice:  oi.GetPrice(),
+		Size:        oi.Size,
+		StopLoss:    slPrice,
+		TakeProfit:  tpPrice,
+		Status:      types.PositionStatusOpen,
+		OpenTime:    time.Now(),
+		OrderID:     orderID,
+		PeakPrice:   oi.GetPrice(),               // Инициализируем PeakPrice как EntryPrice
+		EntryATR:    atr,                         // ATR на момент входа
+		TrailOffset: atr * s.config.TrailATRMult, // смещение для трейлинга
+	}
+
+	// Extract algo order IDs from the response
+	if len(resp.Data) > 0 && len(resp.Data[0].AttachAlgoOrds) > 0 {
+		for _, algoOrd := range resp.Data[0].AttachAlgoOrds {
+			// Check if this is a stop loss order (has slTriggerPx)
+			if algoOrd.SlTriggerPx != nil {
+				pos.StopLossAlgoID = algoOrd.AlgoID
+				log.Printf("✅ Captured SL algo order ID: %s", pos.StopLossAlgoID)
+				break
+			}
+		}
+	}
+
+	// Use the centralized trailing stop manager instead of creating directly
+	if s.config.UseTrailingStop && s.config.TrailingPercent > 0 {
+		log.Printf("DEBUG: Trailing stop config - UseTrailingStop=%v, TrailingPercent=%.3f",
+			s.config.UseTrailingStop, s.config.TrailingPercent)
+		log.Printf("DEBUG: About to initialize trailing stop via manager - size=%.3f entry=%.5f", oi.Size, oi.GetPrice())
+
+		// Initialize trailing stop through the manager
+		if s.trailingManager != nil {
+			// Using type assertion to call the manager method
+			if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
+				if err := mgr.InitializeTrailingForPosition(pos, oi.GetPrice(), slPrice); err != nil {
+					log.Printf("⚠️ Failed to initialize trailing stop via manager: %v", err)
+					// Fallback: if manager fails, we can still use fixed SL
+					pos.StopLoss = slPrice
+				} else {
+					log.Printf("✅ Trailing stop managed by centralized manager for position %s", pos.ID)
+				}
+			} else {
+				log.Printf("⚠️ Trailing manager type assertion failed, using fallback SL: %.4f", slPrice)
+				pos.StopLoss = slPrice
+			}
+		} else {
+			log.Printf("⚠️ Trailing manager not available, using fallback SL: %.4f", slPrice)
+			pos.StopLoss = slPrice
+		}
+	} else {
+		log.Printf("ℹ️ Native trailing not set - condition not met: UseTrailingStop=%v, TrailingPercent=%.3f",
+			s.config.UseTrailingStop, s.config.TrailingPercent)
+	}
+
+	s.positionsMu.Lock()
+	s.activePositions[pos.ID] = pos
+	s.positionsMu.Unlock()
+
+	// Schedule immediate position sync to ensure consistency with exchange
+	go func() {
+		time.Sleep(1 * time.Second) // Small delay to allow exchange to process
+		s.syncPositionsFromExchange()
+	}()
+
+	// Increment daily trade counter
+	if s.trailingManager != nil {
+		if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
+			_ = mgr // Use the variable to avoid "declared and not used" error
+			// Call the increment function through the manager
+			// This would require adding an increment function to the manager
+		}
+	}
+
+	log.Printf("✅ Entry %s %.3f @ %.2f  SL=%.2f  TP=%.2f",
+		side, oi.Size, oi.GetPrice(), slPrice, tpPrice)
+	return nil
 }
 
 // TradingStrategy interface defines trading strategy operations
@@ -499,21 +505,21 @@ func (s *AdvancedTradingStrategy) enterWithSLTP(side types.OrderSide, candle *ty
 func (s *AdvancedTradingStrategy) atrStop(entryPx float64, side types.OrderSide, atr float64, multiplier float64) float64 {
 	// Защита от нулевых или отрицательных значений
 	log.Printf("DEBUG atrStop - entryPx: %.5f, atr: %.5f, multiplier: %.2f", entryPx, atr, multiplier)
-	
+
 	if atr <= 0 || multiplier <= 0 {
 		log.Printf("⚠️ ATR(%.5f) or multiplier(%.2f) is zero, using fallback", atr, multiplier)
 		// Используем разумные fallback-значения
 		if atr <= 0 {
-			atr = entryPx * 0.005  // 0.5% от цены как fallback для ATR
+			atr = entryPx * 0.005 // 0.5% от цены как fallback для ATR
 		}
 		if multiplier <= 0 {
-			multiplier = 0.5  // 0.5 как fallback для множителя
+			multiplier = 0.5 // 0.5 как fallback для множителя
 		}
 	}
-	
+
 	distance := atr * multiplier
 	log.Printf("DEBUG atrStop - distance: %.5f (atr: %.5f * multiplier: %.2f)", distance, atr, multiplier)
-	
+
 	var stopPx float64
 	switch side {
 	case types.OrderSideBuy:
@@ -521,14 +527,14 @@ func (s *AdvancedTradingStrategy) atrStop(entryPx float64, side types.OrderSide,
 	case types.OrderSideSell:
 		stopPx = entryPx + distance
 	}
-	
+
 	log.Printf("DEBUG atrStop - before rounding: stopPx = %.5f (entryPx: %.5f, distance: %.5f)", stopPx, entryPx, distance)
-	
+
 	// округляем до шага тика 0.01 (для большинства USDT-пар)
 	stopPx = math.Round(stopPx*100) / 100
-	
+
 	log.Printf("DEBUG atrStop - after rounding: stopPx = %.5f", stopPx)
-	
+
 	// Проверяем, чтобы цена не была отрицательной или нулевой
 	if stopPx <= 0 {
 		log.Printf("⚠️ atrStop result is zero or negative: %.5f, using fallback", stopPx)
@@ -542,9 +548,10 @@ func (s *AdvancedTradingStrategy) atrStop(entryPx float64, side types.OrderSide,
 		stopPx = math.Round(stopPx*100) / 100
 		log.Printf("DEBUG atrStop - after fallback: stopPx = %.5f", stopPx)
 	}
-	
+
 	return stopPx
 }
+
 type TradingStrategy interface {
 	Initialize(ctx context.Context) error
 	Update(candle *types.Candle)
@@ -664,31 +671,80 @@ func getOrDefaultInt(value, defaultValue int) int {
 
 // syncPositionsFromExchange synchronizes internal positions with exchange positions
 func (s *AdvancedTradingStrategy) syncPositionsFromExchange() error {
-	positions, _ := s.restClient.GetPositions("SWAP")
-	
+	positions, err := s.restClient.GetPositions("SWAP")
+	if err != nil {
+		log.Printf("⚠️ Failed to fetch positions from exchange: %v", err)
+		return err
+	}
+
 	s.positionsMu.Lock()
 	defer s.positionsMu.Unlock()
 
-	// Если на бирже нет позиций - чистим всё
-	hasActive := false
+	// Build map of exchange positions for our instrument
+	exchangePositions := make(map[string]bool)
 	for _, pos := range positions {
 		if pos.InstID == s.instrumentID && pos.Size > 0 {
-			hasActive = true
-			break
+			// Use position side + size as key for cross-margin mode
+			key := fmt.Sprintf("%s_%.3f", pos.Side, pos.Size)
+			exchangePositions[key] = true
 		}
 	}
 
-	if !hasActive && len(s.activePositions) > 0 {
-		// Отменяем все трейлинги
-		for _, pos := range s.activePositions {
-			if pos.StopLossAlgoID != "" {
-				if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
-					_ = mgr.CancelExecutedTrailing(pos)
+	// Check for positions that exist internally but not on exchange
+	var positionsToRemove []string
+	for posID, pos := range s.activePositions {
+		if pos.Status != types.PositionStatusOpen {
+			continue
+		}
+
+		// Check if this internal position still exists on exchange
+		key := fmt.Sprintf("%s_%.3f", pos.Side, pos.Size)
+		if !exchangePositions[key] {
+			log.Printf("🔍 Position %s (size: %.3f, side: %s) not found on exchange - marking for cleanup", posID, pos.Size, pos.Side)
+			positionsToRemove = append(positionsToRemove, posID)
+		}
+	}
+
+	// Clean up positions that no longer exist on exchange
+	for _, posID := range positionsToRemove {
+		pos := s.activePositions[posID]
+		if pos.StopLossAlgoID != "" {
+			log.Printf("🚫 Cancelling trailing stop %s for closed position %s", pos.StopLossAlgoID, posID)
+			if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
+				if err := mgr.CancelExecutedTrailing(pos); err != nil {
+					log.Printf("⚠️ Failed to cancel trailing stop %s: %v", pos.StopLossAlgoID, err)
+				} else {
+					log.Printf("✅ Successfully cancelled trailing stop %s", pos.StopLossAlgoID)
 				}
 			}
 		}
+
+		// Mark position as closed
+		now := time.Now()
+		pos.Status = types.PositionStatusClosed
+		pos.CloseTime = &now
+		delete(s.activePositions, posID)
+		log.Printf("🔄 Removed closed position %s from internal tracking", posID)
+	}
+
+	// Legacy: Also clean all if no positions at all on exchange
+	if len(exchangePositions) == 0 && len(s.activePositions) > 0 {
+		log.Printf("🔍 Exchange sync: Found %d internal positions but no active positions on exchange", len(s.activePositions))
+		for posID, pos := range s.activePositions {
+			if pos.StopLossAlgoID != "" {
+				log.Printf("🚫 Cancelling trailing stop %s for closed position %s", pos.StopLossAlgoID, posID)
+				if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
+					if err := mgr.CancelExecutedTrailing(pos); err != nil {
+						log.Printf("⚠️ Failed to cancel trailing stop %s: %v", pos.StopLossAlgoID, err)
+					} else {
+						log.Printf("✅ Successfully cancelled trailing stop %s", pos.StopLossAlgoID)
+					}
+				}
+			}
+		}
+		posCount := len(s.activePositions)
 		s.activePositions = make(map[string]*types.Position)
-		log.Printf("🔄 All positions cleared - exchange shows no active positions")
+		log.Printf("🔄 All %d internal positions cleared - exchange shows no active positions", posCount)
 	}
 
 	return nil
@@ -839,9 +895,12 @@ func (s *AdvancedTradingStrategy) Update(candle *types.Candle) {
 
 	// Check liquidation risk to prevent forced liquidation
 	s.checkLiquidationRisk(candle.Close)
-	
+
 	// Periodically synchronize positions with exchange to ensure consistency
-	if time.Since(s.lastSyncTime) > 30*time.Second {
+	// Also sync immediately if we have positions but infrequent updates
+	shouldSync := time.Since(s.lastSyncTime) > 5*time.Second
+	hasActivePositions := len(s.activePositions) > 0
+	if shouldSync || (hasActivePositions && time.Since(s.lastSyncTime) > 2*time.Second) {
 		s.syncPositionsFromExchange()
 		s.lastSyncTime = time.Now()
 	}
@@ -892,7 +951,7 @@ func (s *AdvancedTradingStrategy) canTrade(candle *types.Candle) bool {
 	if s.lastSignalBarIndex != nil && s.candleBuffer.Size()-*s.lastSignalBarIndex <= s.cooldownBars {
 		log.Printf("DEBUG cooldown: lastSignalBarIndex=%v, currentBarIndex=%d, diff=%d, cooldown=%d",
 			s.lastSignalBarIndex, s.candleBuffer.Size()-1,
-			s.candleBuffer.Size()-1 - *s.lastSignalBarIndex, s.cooldownBars)
+			s.candleBuffer.Size()-1-*s.lastSignalBarIndex, s.cooldownBars)
 		log.Println("⏳ Cooldown period - cannot trade")
 		return false
 	}
@@ -900,7 +959,7 @@ func (s *AdvancedTradingStrategy) canTrade(candle *types.Candle) bool {
 	if s.lastSignalBarIndex != nil {
 		log.Printf("DEBUG cooldown: lastSignalBarIndex=%v, currentBarIndex=%d, diff=%d, cooldown=%d",
 			s.lastSignalBarIndex, s.candleBuffer.Size()-1,
-			s.candleBuffer.Size()-1 - *s.lastSignalBarIndex, s.cooldownBars)
+			s.candleBuffer.Size()-1-*s.lastSignalBarIndex, s.cooldownBars)
 	}
 
 	// Check if we already have an active position
@@ -966,17 +1025,17 @@ func (s *AdvancedTradingStrategy) setupGuaranteedExit(side types.OrderSide, fill
 
 		if side == types.OrderSideBuy {
 			// For long: stop-loss at entry price minus ATR-based distance
-			initialATR := s.calculateATR([]float64{filledPrice * 1.02, filledPrice * 0.98, filledPrice * 0.99}, 
-										  []float64{filledPrice * 0.98, filledPrice * 0.96, filledPrice * 0.97}, 
-										  []float64{filledPrice, filledPrice * 0.97, filledPrice * 0.98}, 2) // dummy values just for initial calculation
+			initialATR := s.calculateATR([]float64{filledPrice * 1.02, filledPrice * 0.98, filledPrice * 0.99},
+				[]float64{filledPrice * 0.98, filledPrice * 0.96, filledPrice * 0.97},
+				[]float64{filledPrice, filledPrice * 0.97, filledPrice * 0.98}, 2) // dummy values just for initial calculation
 			initialTrailDist := initialATR * s.config.TrailATRMult
 			slPrice = filledPrice - initialTrailDist
 			closeSide = types.OrderSideSell
 		} else {
 			// For short: stop-loss at entry price plus ATR-based distance
-			initialATR := s.calculateATR([]float64{filledPrice * 1.02, filledPrice * 0.98, filledPrice * 0.99}, 
-										  []float64{filledPrice * 0.98, filledPrice * 0.96, filledPrice * 0.97}, 
-										  []float64{filledPrice, filledPrice * 0.97, filledPrice * 0.98}, 2) // dummy values just for initial calculation
+			initialATR := s.calculateATR([]float64{filledPrice * 1.02, filledPrice * 0.98, filledPrice * 0.99},
+				[]float64{filledPrice * 0.98, filledPrice * 0.96, filledPrice * 0.97},
+				[]float64{filledPrice, filledPrice * 0.97, filledPrice * 0.98}, 2) // dummy values just for initial calculation
 			initialTrailDist := initialATR * s.config.TrailATRMult
 			slPrice = filledPrice + initialTrailDist
 			closeSide = types.OrderSideBuy
@@ -1004,7 +1063,7 @@ func (s *AdvancedTradingStrategy) setupGuaranteedExit(side types.OrderSide, fill
 				// Calculate required margin for stop-loss (approximately 1% of position nominal)
 				requiredMargin := filledSize * slPrice * 0.01
 				if isoBal < requiredMargin {
-					log.Printf("⚠️ Insufficient USDT in isolated account for stop-loss: need %.2f, available %.2f", 
+					log.Printf("⚠️ Insufficient USDT in isolated account for stop-loss: need %.2f, available %.2f",
 						requiredMargin, isoBal)
 					return // Skip creating stop-loss if not enough margin
 				}
@@ -1039,11 +1098,11 @@ func (s *AdvancedTradingStrategy) setupGuaranteedExit(side types.OrderSide, fill
 
 		if side == types.OrderSideBuy {
 			// For long: stop-loss 1.5% below entry price (for initial setup)
-			slPrice = math.Round((filledPrice * 0.985) * 100) / 100 // 1.5% below, rounded to 0.01
+			slPrice = math.Round((filledPrice*0.985)*100) / 100 // 1.5% below, rounded to 0.01
 			closeSide = types.OrderSideSell
 		} else {
 			// For short: stop-loss 1.5% above entry price (for initial setup)
-			slPrice = math.Round((filledPrice * 1.015) * 100) / 100 // 1.5% above, rounded to 0.01
+			slPrice = math.Round((filledPrice*1.015)*100) / 100 // 1.5% above, rounded to 0.01
 			closeSide = types.OrderSideBuy
 		}
 
@@ -1059,7 +1118,7 @@ func (s *AdvancedTradingStrategy) setupGuaranteedExit(side types.OrderSide, fill
 		} else {
 			posSide = "short" // When closing a long, we're selling (short) to close
 		}
-		
+
 		// For trailing stop: Check if isolated balance is sufficient for stop-loss order
 		if s.config.AllInMode { // Only check for AllInMode which uses isolated
 			isoBal, err := s.restClient.GetIsolatedBalance(s.instrumentID)
@@ -1069,7 +1128,7 @@ func (s *AdvancedTradingStrategy) setupGuaranteedExit(side types.OrderSide, fill
 				// Calculate required margin for stop-loss (approximately 1% of position nominal)
 				requiredMargin := filledSize * slPrice * 0.01
 				if isoBal < requiredMargin {
-					log.Printf("⚠️ Insufficient USDT in isolated account for stop-loss: need %.2f, available %.2f", 
+					log.Printf("⚠️ Insufficient USDT in isolated account for stop-loss: need %.2f, available %.2f",
 						requiredMargin, isoBal)
 					return // Skip creating stop-loss if not enough margin
 				}
@@ -1132,7 +1191,7 @@ func (s *AdvancedTradingStrategy) setupTakeProfit(side types.OrderSide, filledPr
 		tpPrice = filledPrice - minDistance
 		closeSide = types.OrderSideBuy
 	}
-	
+
 	// Round to tick size (0.01 for most USDT pairs)
 	tpPrice = math.Round(tpPrice*100) / 100
 
@@ -1206,7 +1265,7 @@ func (s *AdvancedTradingStrategy) setupTakeProfit(side types.OrderSide, filledPr
 		log.Printf("⚠️ TP order not set: %v", err)
 		log.Printf("❌ TP algo order response: %+v", response)
 	} else {
-		log.Printf("✅ TP set at %.4f (size: %.3f, exit type: %s)", tpPrice, filledSize, 
+		log.Printf("✅ TP set at %.4f (size: %.3f, exit type: %s)", tpPrice, filledSize,
 			map[bool]string{true: "limit", false: "market"}[s.config.UseLimitOrdersForExit])
 	}
 }
@@ -1339,7 +1398,7 @@ func (e *AllInExecutor) EnterLongShort(ctx context.Context, side types.OrderSide
 	price := tick.Last
 
 	// 4. Размер контракта - используем все доступные средства с запасом
-	const stopLossBuffer = 5.0                                   // USDT buffer for stop-loss collateral in isolated mode
+	const stopLossBuffer = 5.0                                  // USDT buffer for stop-loss collateral in isolated mode
 	contractVal := 0.1                                          // минимальный размер для фьючерсов
 	maxSize := (avail - 0.6 - stopLossBuffer) / price           // вычитаем 0.6 на комиссии и stopLossBuffer на залог
 	size := math.Floor((maxSize-0.1)/contractVal) * contractVal // округляем вниз до 0.1 с запасом 0.1$
@@ -1528,14 +1587,14 @@ func (s *AdvancedTradingStrategy) updateTrailingStops(currentPrice float64) {
 				highs := make([]float64, s.atrLength)
 				lows := make([]float64, s.atrLength)
 				closes := make([]float64, s.atrLength)
-				
+
 				for i := 0; i < s.atrLength; i++ {
 					candle := candles[startIdx+i]
 					highs[i] = candle.High
 					lows[i] = candle.Low
 					closes[i] = candle.Close
 				}
-				
+
 				// Calculate current ATR using the full ATR length
 				currentATR := s.calculateATR(highs, lows, closes, s.atrLength)
 				trailDistance := currentATR * s.config.TrailATRMult
@@ -1557,7 +1616,7 @@ func (s *AdvancedTradingStrategy) updateTrailingStops(currentPrice float64) {
 				// Update stop only if it improves the position (tighter stop)
 				if (pos.Side == types.OrderSideBuy && newStop > pos.StopLoss) ||
 					(pos.Side == types.OrderSideSell && newStop < pos.StopLoss) {
-					
+
 					// Only update if the price change is significant enough to avoid excessive API calls
 					priceDiff := math.Abs(newStop - pos.StopLoss)
 					if priceDiff >= 0.01 { // Minimum 0.01 USDT change threshold
@@ -1573,7 +1632,7 @@ func (s *AdvancedTradingStrategy) updateTrailingStops(currentPrice float64) {
 								&triggerPx,
 								nil, // Market execution
 							)
-							
+
 							if err != nil {
 								log.Printf("⚠️ Failed to amend SL order: %v", err)
 								// Fallback to cancel and replace approach
@@ -1582,7 +1641,7 @@ func (s *AdvancedTradingStrategy) updateTrailingStops(currentPrice float64) {
 									log.Printf("⚠️ Could not cancel old SL algo order: %v", cancelErr)
 								} else {
 									log.Printf("🔄 Cancelled old SL algo order: %s", pos.StopLossAlgoID)
-									
+
 									// Place new SL order with updated price
 									var closeSide types.OrderSide
 									var posSide string
@@ -1601,7 +1660,7 @@ func (s *AdvancedTradingStrategy) updateTrailingStops(currentPrice float64) {
 										PosSide:     posSide,
 										Size:        pos.Size,
 										SlTriggerPx: newStop,
-										SlOrdPx:     "-1",    // Market order execution
+										SlOrdPx:     "-1", // Market order execution
 										OrderType:   "conditional",
 										ClOrdID:     fmt.Sprintf("atrsl%d%04d", time.Now().Unix(), rand.Intn(10000)),
 									}
@@ -1614,7 +1673,7 @@ func (s *AdvancedTradingStrategy) updateTrailingStops(currentPrice float64) {
 										pos.StopLossAlgoID = response.Data[0].OrderID
 										pos.StopLoss = newStop
 										s.activePositions[id] = pos
-										log.Printf("✅ Updated ATR trailing SL order placed at %.4f (ID: %s) - ATR: %.4f, Distance: %.4f", 
+										log.Printf("✅ Updated ATR trailing SL order placed at %.4f (ID: %s) - ATR: %.4f, Distance: %.4f",
 											newStop, pos.StopLossAlgoID, currentATR, trailDistance)
 									}
 								}
@@ -1626,7 +1685,7 @@ func (s *AdvancedTradingStrategy) updateTrailingStops(currentPrice float64) {
 									log.Printf("⚠️ Could not cancel old SL algo order: %v", cancelErr)
 								} else {
 									log.Printf("🔄 Cancelled old SL algo order: %s", pos.StopLossAlgoID)
-									
+
 									// Place new SL order with updated price
 									var closeSide types.OrderSide
 									var posSide string
@@ -1645,7 +1704,7 @@ func (s *AdvancedTradingStrategy) updateTrailingStops(currentPrice float64) {
 										PosSide:     posSide,
 										Size:        pos.Size,
 										SlTriggerPx: newStop,
-										SlOrdPx:     "-1",    // Market order execution
+										SlOrdPx:     "-1", // Market order execution
 										OrderType:   "conditional",
 										ClOrdID:     fmt.Sprintf("atrsl%d%04d", time.Now().Unix(), rand.Intn(10000)),
 									}
@@ -1658,7 +1717,7 @@ func (s *AdvancedTradingStrategy) updateTrailingStops(currentPrice float64) {
 										pos.StopLossAlgoID = response.Data[0].OrderID
 										pos.StopLoss = newStop
 										s.activePositions[id] = pos
-										log.Printf("✅ Updated ATR trailing SL order placed at %.4f (ID: %s) - ATR: %.4f, Distance: %.4f", 
+										log.Printf("✅ Updated ATR trailing SL order placed at %.4f (ID: %s) - ATR: %.4f, Distance: %.4f",
 											newStop, pos.StopLossAlgoID, currentATR, trailDistance)
 									}
 								}
@@ -1666,24 +1725,24 @@ func (s *AdvancedTradingStrategy) updateTrailingStops(currentPrice float64) {
 								// Successfully amended the order
 								pos.StopLoss = newStop
 								s.activePositions[id] = pos
-								log.Printf("✅ Amended ATR trailing SL order to %.4f (ID: %s) - ATR: %.4f, Distance: %.4f", 
+								log.Printf("✅ Amended ATR trailing SL order to %.4f (ID: %s) - ATR: %.4f, Distance: %.4f",
 									newStop, pos.StopLossAlgoID, currentATR, trailDistance)
 							}
 						} else {
 							// If no conditional order ID exists, update locally only
 							pos.StopLoss = newStop
 							s.activePositions[id] = pos
-							log.Printf("📊 Updated ATR trailing SL locally at %.4f - ATR: %.4f, Distance: %.4f", 
+							log.Printf("📊 Updated ATR trailing SL locally at %.4f - ATR: %.4f, Distance: %.4f",
 								newStop, currentATR, trailDistance)
 						}
 					} else {
 						// Log when the trailing stop doesn't improve or change is too small (for debugging)
-						log.Printf("⏳ ATR trailing: No improvement or change too small (%.4f < 0.01) - current: %.4f, proposed: %.4f (ATR: %.4f)", 
+						log.Printf("⏳ ATR trailing: No improvement or change too small (%.4f < 0.01) - current: %.4f, proposed: %.4f (ATR: %.4f)",
 							priceDiff, pos.StopLoss, newStop, currentATR)
 					}
 				} else {
 					// Log when the trailing stop doesn't improve (for debugging)
-					log.Printf("⏳ ATR trailing: No improvement - current: %.4f, proposed: %.4f (ATR: %.4f)", 
+					log.Printf("⏳ ATR trailing: No improvement - current: %.4f, proposed: %.4f (ATR: %.4f)",
 						pos.StopLoss, newStop, currentATR)
 				}
 			} else {
@@ -1716,7 +1775,7 @@ func (s *AdvancedTradingStrategy) updateTrailingStops(currentPrice float64) {
 						pos.StopLoss = math.Round(newStop*100) / 100 // 0.01
 					} else {
 						// Log when the change is too small (for debugging)
-						log.Printf("⏳ Pine trailing: Change too small (%.4f < 0.01) - current: %.4f, proposed: %.4f", 
+						log.Printf("⏳ Pine trailing: Change too small (%.4f < 0.01) - current: %.4f, proposed: %.4f",
 							priceDiff, pos.StopLoss, newStop)
 					}
 				}
@@ -1744,7 +1803,7 @@ func (s *AdvancedTradingStrategy) updateTrailingStops(currentPrice float64) {
 					s.activePositions[id] = pos
 				} else {
 					// Log when the change is too small (for debugging)
-					log.Printf("⏳ Basic trailing: Change too small (%.4f < 0.01) - current: %.4f, proposed: %.4f", 
+					log.Printf("⏳ Basic trailing: Change too small (%.4f < 0.01) - current: %.4f, proposed: %.4f",
 						priceDiff, pos.StopLoss, newStop)
 				}
 			}
@@ -1920,9 +1979,14 @@ func (s *AdvancedTradingStrategy) closePositionImmediately(instID string, curren
 func (s *AdvancedTradingStrategy) closePosition(positionID string, position *types.Position, closePrice float64, reason string) {
 	// Отменяем трейлинг при закрытии
 	if position.StopLossAlgoID != "" {
+		log.Printf("🔄 Cancelling trailing stop ID: %s for position %s", position.StopLossAlgoID, positionID)
 		if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
-			_ = mgr.CancelExecutedTrailing(position)
+			if err := mgr.CancelExecutedTrailing(position); err != nil {
+				log.Printf("⚠️ Failed to cancel trailing stop: %v", err)
+			}
 		}
+	} else {
+		log.Printf("📋 No trailing stop to cancel for position %s", positionID)
 	}
 
 	// Быстрый расчет P&L
@@ -1939,7 +2003,13 @@ func (s *AdvancedTradingStrategy) closePosition(positionID string, position *typ
 
 	delete(s.activePositions, positionID)
 	s.closedPositions = append(s.closedPositions, position)
-	
+
+	// Trigger immediate position sync to ensure cleanup on exchange side
+	go func() {
+		time.Sleep(500 * time.Millisecond) // Small delay to allow exchange to process
+		s.syncPositionsFromExchange()
+	}()
+
 	log.Printf("🚪 EXIT %s | Price=%.2f | Reason=%s | PnL=%.2f USDT",
 		positionID, closePrice, reason, pnl)
 }

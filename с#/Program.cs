@@ -68,10 +68,10 @@ namespace OKXTraderBot
                     });
                 });
 
-                Console.WriteLine("🎯 Webhook endpoint: http://localhost:5000/tv-signal");
-                Console.WriteLine("📊 Status endpoint:  http://localhost:5000/status");
+                Console.WriteLine("🎯 Webhook endpoint: http://localhost:5500/tv-signal");
+                Console.WriteLine("📊 Status endpoint:  http://localhost:5500/status");
 
-                _ = app.RunAsync("http://0.0.0.0:5000");
+                _ = app.RunAsync("http://0.0.0.0:5500");
 
                 Console.WriteLine("Нажмите ENTER для остановки…");
                 Console.ReadLine();
