@@ -1,4 +1,4 @@
-package client
+package test
 
 import (
 	"bytes"
@@ -341,7 +341,7 @@ func (c *OKXRestClient) PlaceTrailingStop(instID string, tdMode string, closeSid
 		"sz":            strconv.FormatFloat(size, 'f', -1, 64),
 		"activationPx":  strconv.FormatFloat(activationPrice, 'f', -1, 64),
 		"callbackRatio": strconv.FormatFloat(callbackRatio, 'f', -1, 64), // ratio (e.g. 0.015 = 1.5%)
-		"orderPx":       "-1", // market execution
+		"orderPx":       "-1",                                            // market execution
 	}
 
 	return c.sendRequest("POST", endpoint, body)
@@ -737,8 +737,8 @@ func (c *OKXRestClient) TransferToCross(ccy string, amt float64) error {
 	body := map[string]interface{}{
 		"ccy":  ccy,
 		"amt":  fmt.Sprintf("%.6f", amt),
-		"from": "6",  // Funding
-		"to":   "3",  // Cross-margin
+		"from": "6", // Funding
+		"to":   "3", // Cross-margin
 	}
 
 	respBody, err := c.sendRequestAndReadRawResponse("POST", "/api/v5/asset/transfer", body)

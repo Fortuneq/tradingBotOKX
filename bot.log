@@ -9,11 +9,11 @@
 2025/09/26 18:26:50 ✅ Trading Bot started for SOL-USDT (SPOT)
 2025/09/26 18:26:50 📊 Real-time 30m candles via WebSocket + polling every 5 seconds
 2025/09/26 18:26:50 🔄 Trailing stops updated every 1 second
-2025/09/26 18:26:50 🎯 Webhook endpoint: http://localhost:5000/tv-signal
-2025/09/26 18:26:50 📊 Status endpoint: http://localhost:5000/status
-2025/09/26 18:26:50 📈 Positions endpoint: http://localhost:5000/positions
-2025/09/26 18:26:50 🔧 Manual trade endpoint: http://localhost:5000/manual-trade
-2025/09/26 18:26:50 🌐 Starting HTTP server on :5000
+2025/09/26 18:26:50 🎯 Webhook endpoint: http://localhost:5500/tv-signal
+2025/09/26 18:26:50 📊 Status endpoint: http://localhost:5500/status
+2025/09/26 18:26:50 📈 Positions endpoint: http://localhost:5500/positions
+2025/09/26 18:26:50 🔧 Manual trade endpoint: http://localhost:5500/manual-trade
+2025/09/26 18:26:50 🌐 Starting HTTP server on :5500
 2025/09/26 18:26:50 ✅ OKX Trading Bot is running...
 2025/09/26 18:26:50 📝 Available endpoints:
 2025/09/26 18:26:50    • POST /tv-signal     - TradingView webhook

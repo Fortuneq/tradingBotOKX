@@ -17,6 +17,12 @@ import (
 	"okx-trading-bot/handlers"
 )
 
+// Global variables for tracking daily trades
+var (
+	dailyTrades   int
+	lastTradeDate string
+)
+
 func main() {
 	log.Println("🚀 Starting OKX Trading Bot")
 
@@ -60,7 +66,7 @@ func main() {
 
 	// Create HTTP server
 	server := &http.Server{
-		Addr:         ":5000",
+		Addr:         ":5500",
 		Handler:      router,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
@@ -69,7 +75,7 @@ func main() {
 
 	// Start HTTP server in a goroutine
 	go func() {
-		log.Println("🌐 Starting HTTP server on :5000")
+		log.Println("🌐 Starting HTTP server on :5500")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("❌ HTTP server error: %v", err)
 		}

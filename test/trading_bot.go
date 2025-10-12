@@ -1,4 +1,4 @@
-package bot
+package test
 
 import (
 	"context"
@@ -482,19 +482,19 @@ func (bot *TradingBot) processTrailingStops() {
 
 		var posSide string
 		if closeSide == types.OrderSideBuy {
-			posSide = "long"   // When closing short position, we buy (long)
+			posSide = "long" // When closing short position, we buy (long)
 		} else {
-			posSide = "short"  // When closing long position, we sell (short)
+			posSide = "short" // When closing long position, we sell (short)
 		}
-		
+
 		algoOrder := &types.AlgoOrderRequest{
 			InstID:      bot.config.OKX.InstrumentID,
 			TdMode:      "isolated", // Use isolated mode to avoid cross margin issues
 			Side:        closeSide,
 			PosSide:     posSide, // Use correct position side
 			Size:        pos.Size,
-			SlTriggerPx: newStop,  // Use the correct field
-			SlOrdPx:     "-1",     // Market order for stop loss execution
+			SlTriggerPx: newStop, // Use the correct field
+			SlOrdPx:     "-1",    // Market order for stop loss execution
 			OrderType:   "conditional",
 			ClOrdID:     fmt.Sprintf("trail%d%04d", time.Now().Unix(), rand.Intn(10000)),
 		}

@@ -16,7 +16,6 @@ import (
 	"okx-trading-bot/strategy"
 	"okx-trading-bot/types"
 )
-)
 
 // TradingBot orchestrates market data, strategy, and order execution
 type TradingBot struct {
@@ -73,10 +72,8 @@ func NewTradingBot(cfg *config.Config) (*TradingBot, error) {
 
 	// Create trailing stop manager
 	trailingConfig := &strategy.TrailingConfig{
-		Enabled:        cfg.Strategy.UseTrailingStop,
-		CallbackRatio:  cfg.Strategy.TrailingPercent / 100.0,
-		UpdateInterval: 1 * time.Second,
-		MinPriceChange: 0.01,
+		Enabled:       cfg.Strategy.UseTrailingStop,
+		CallbackRatio: cfg.Strategy.TrailingPercent / 100.0,
 	}
 
 	bot := &TradingBot{
@@ -389,7 +386,7 @@ func (bot *TradingBot) onTradeSignal(signal *types.TradeSignal) error {
 
 	// Increment daily trade counter
 	incrementDailyTrade()
-	
+
 	log.Printf("📈 Trade Signal: %s %.3f @ %.2f (Strategy: %s)",
 		signal.Side, signal.Size, signal.EntryPrice, signal.Strategy)
 
@@ -544,8 +541,8 @@ func (bot *TradingBot) processTrailingStops() {
 
 		// === ЛОГ: проверяем, что OKX действительно обновил трейлинг ===
 		if pos.StopLossAlgoID != "" {
-			activationPx, callbackRatio, err := 
-		bot.restClient.GetTrailingAlgoInfo(pos.StopLossAlgoID, bot.config.OKX.InstrumentID)
+			activationPx, callbackRatio, err :=
+				bot.restClient.GetTrailingAlgoInfo(pos.StopLossAlgoID, bot.config.OKX.InstrumentID)
 			if err == nil {
 				// Рассчитываем текущий эффективный SL
 				var effectiveSL float64
@@ -559,7 +556,7 @@ func (bot *TradingBot) processTrailingStops() {
 				if math.Abs(effectiveSL-pos.LastLoggedSL) > 0.001 {
 					log.Printf("✅ Trailing updated: SL %.5f → %.5f (peak=%.5f, callback=%.4f%%) algoID=%s",
 						pos.LastLoggedSL, effectiveSL, activationPx, callbackRatio*100,
-		pos.StopLossAlgoID)
+						pos.StopLossAlgoID)
 					pos.LastLoggedSL = effectiveSL
 				} else {
 					log.Printf("⏳ Trailing unchanged: SL %.5f (peak=%.5f, callback=%.4f%%)",

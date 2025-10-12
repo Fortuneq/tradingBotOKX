@@ -1,6 +1,6 @@
 // Быстрый тест торговой логики
 // Запуск: go run quick_test.go
-package main
+package test
 
 import (
 	"fmt"
