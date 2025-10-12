@@ -9,7 +9,7 @@ import (
 
 // calculateRSI calculates the Relative Strength Index
 func (s *AdvancedTradingStrategy) calculateRSI(closes []float64, period int) []float64 {
-	if len(closes) < period || period <= 0 {
+	if len(closes) < 2 || period <= 0 { // <-- достаточно 2 свечей для RSI(1)
 		return []float64{}
 	}
 

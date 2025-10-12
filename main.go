@@ -159,3 +159,24 @@ func validateConfiguration(cfg *config.Config) error {
 
 	return nil
 }
+
+// IncrementDailyTrade increments the daily trade counter
+func IncrementDailyTrade() {
+	currentDate := time.Now().Format("2006-01-02")
+	if currentDate != lastTradeDate {
+		dailyTrades = 0
+		lastTradeDate = currentDate
+	}
+	dailyTrades++
+	log.Printf("📊 Trade #%d today", dailyTrades)
+}
+
+// GetDailyTradeCount returns the current daily trade count
+func GetDailyTradeCount() int {
+	currentDate := time.Now().Format("2006-01-02")
+	if currentDate != lastTradeDate {
+		dailyTrades = 0
+		lastTradeDate = currentDate
+	}
+	return dailyTrades
+}

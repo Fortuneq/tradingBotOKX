@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -33,9 +32,9 @@ func testWebsocket() {
 			{"channel": "candle30m", "instId": "SOL-USDT"},
 		},
 	}
-	
+
 	fmt.Printf("Sending subscription: %+v\n", sub)
-	
+
 	if err := c.WriteJSON(sub); err != nil {
 		log.Fatal("subscribe:", err)
 	}
@@ -78,12 +77,12 @@ func testWebsocket() {
 			ts, _ := strconv.ParseInt(raw[0], 10, 64)
 			close, _ := strconv.ParseFloat(raw[4], 64)
 			volume, _ := strconv.ParseFloat(raw[5], 64)
-			fmt.Printf("🕯️  %s  O=%.4f H=%.4f L=%.4f C=%.4f V=%.1f\n", 
-				time.UnixMilli(ts).Format("15:04"), 
-				close, 
-				parseFloat(raw[2]), 
-				parseFloat(raw[3]), 
-				close, 
+			fmt.Printf("🕯️  %s  O=%.4f H=%.4f L=%.4f C=%.4f V=%.1f\n",
+				time.UnixMilli(ts).Format("15:04"),
+				close,
+				parseFloat(raw[2]),
+				parseFloat(raw[3]),
+				close,
 				volume)
 		}
 	}

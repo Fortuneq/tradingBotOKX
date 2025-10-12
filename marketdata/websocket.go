@@ -154,15 +154,19 @@ func (s *OKXMarketDataService) authenticate() error {
 
 // subscribe sends subscription message
 func (s *OKXMarketDataService) subscribe() error {
-	// Subscribe to candle channel only - pings keep connection alive for futures/swaps
+	// Subscribe to both candle and ticker channels
 	channel := "candle" + strings.ToLower(strings.TrimSpace(s.timeframe))
 	instId := strings.ToUpper(strings.TrimSpace(s.instrumentID))
-	
+
 	subscribeMsg := map[string]interface{}{
 		"op": "subscribe",
 		"args": []map[string]interface{}{
 			{
 				"channel": channel,
+				"instId":  instId,
+			},
+			{
+				"channel": "tickers",
 				"instId":  instId,
 			},
 		},
@@ -195,21 +199,21 @@ func (s *OKXMarketDataService) processMessages() {
 // processMessage processes individual WebSocket messages
 func (s *OKXMarketDataService) processMessage(msg map[string]interface{}) {
 	// Handle errors
-	if event, ok := msg["event"] .(string); ok && event == "error" {
-		if msgText, ok := msg["msg"] .(string); ok {
+	if event, ok := msg["event"].(string); ok && event == "error" {
+		if msgText, ok := msg["msg"].(string); ok {
 			log.Printf("⚠️ WebSocket error: %s", msgText)
 		}
 		return
 	}
 
 	// Handle data messages
-	if arg, ok := msg["arg"] .(map[string]interface{}); ok {
-		if channel, ok := arg["channel"] .(string); ok {
+	if arg, ok := msg["arg"].(map[string]interface{}); ok {
+		if channel, ok := arg["channel"].(string); ok {
 			// Handle ticker data
 			if channel == "tickers" {
-				if data, ok := msg["data"] .([]interface{}); ok && len(data) > 0 {
+				if data, ok := msg["data"].([]interface{}); ok && len(data) > 0 {
 					if tickerData, ok := data[0].(map[string]interface{}); ok {
-						if lastStr, ok := tickerData["last"] .(string); ok {
+						if lastStr, ok := tickerData["last"].(string); ok {
 							if lastPrice, err := strconv.ParseFloat(lastStr, 64); err == nil && s.onPriceUpdate != nil {
 								s.onPriceUpdate(lastPrice)
 							}
@@ -219,7 +223,7 @@ func (s *OKXMarketDataService) processMessage(msg map[string]interface{}) {
 			}
 			// Handle candle data
 			if channel == "candle"+strings.ToLower(s.timeframe) {
-				if data, ok := msg["data"] .([]interface{}); ok && len(data) > 0 {
+				if data, ok := msg["data"].([]interface{}); ok && len(data) > 0 {
 					if candleArray, ok := data[0].([]interface{}); ok && len(candleArray) >= 6 {
 						// Convert to string array for parsing
 						candleStrings := make([]string, len(candleArray))
@@ -248,7 +252,7 @@ func (s *OKXMarketDataService) processMessage(msg map[string]interface{}) {
 							s.mu.Lock()
 							s.zeroCandleCount = 0
 							s.mu.Unlock()
-							
+
 							s.onCandleUpdate(candle)
 						}
 					}

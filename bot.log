@@ -1,0 +1,33 @@
+2025/09/26 18:26:48 🚀 Starting OKX Trading Bot
+2025/09/26 18:26:48 📊 Configuration loaded - Instrument: SOL-USDT, Timeframe: 30m
+2025/09/26 18:26:48 ⚙️ Strategy - Risk: 90.0%, RSI Length: 2, ATR Length: 14
+2025/09/26 18:26:48 🚀 Starting OKX Trading Bot...
+2025/09/26 18:26:50 WebSocket subscribing: map[args:[map[channel:tickers instId:SOL-USDT]] op:subscribe]
+2025/09/26 18:26:50 ✅ WebSocket connected to OKX (SOL-USDT, 30m)
+2025/09/26 18:26:50 Initializing trading strategy...
+2025/09/26 18:26:50 📊 Loaded 300 historical candles
+2025/09/26 18:26:50 ✅ Trading Bot started for SOL-USDT (SPOT)
+2025/09/26 18:26:50 📊 Real-time 30m candles via WebSocket + polling every 5 seconds
+2025/09/26 18:26:50 🔄 Trailing stops updated every 1 second
+2025/09/26 18:26:50 🎯 Webhook endpoint: http://localhost:5000/tv-signal
+2025/09/26 18:26:50 📊 Status endpoint: http://localhost:5000/status
+2025/09/26 18:26:50 📈 Positions endpoint: http://localhost:5000/positions
+2025/09/26 18:26:50 🔧 Manual trade endpoint: http://localhost:5000/manual-trade
+2025/09/26 18:26:50 🌐 Starting HTTP server on :5000
+2025/09/26 18:26:50 ✅ OKX Trading Bot is running...
+2025/09/26 18:26:50 📝 Available endpoints:
+2025/09/26 18:26:50    • POST /tv-signal     - TradingView webhook
+2025/09/26 18:26:50    • GET  /status        - Bot status
+2025/09/26 18:26:50    • GET  /positions     - Trading positions
+2025/09/26 18:26:50    • GET  /ping          - Health check
+2025/09/26 18:26:50    • POST /manual-trade  - Manual trade execution
+2025/09/26 18:26:50 
+2025/09/26 18:26:50 🛑 Press Ctrl+C to stop the bot
+2025/09/26 18:26:55 [STRATEGY] 18:00:00 | O=192.11 H=192.36 L=190.84 C=191.67 V=7310813.50
+2025/09/26 18:30:05 [STRATEGY] 18:30:00 | O=191.69 H=191.70 L=191.69 C=191.70 V=63.96
+2025/09/26 18:30:10 [STRATEGY] 18:00:00 | O=192.11 H=192.36 L=190.84 C=191.68 V=7424035.90
+2025/09/26 18:30:15 [STRATEGY] 18:30:00 | O=191.69 H=191.77 L=191.69 C=191.77 V=3629.89
+2025/09/26 18:35:53 🛑 Shutdown signal received, stopping bot...
+2025/09/26 18:35:53 🛑 Stopping trading bot...
+2025/09/26 18:35:53 ✅ Trading bot stopped
+2025/09/26 18:35:53 ✅ OKX Trading Bot stopped gracefully

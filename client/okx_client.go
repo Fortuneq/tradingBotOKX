@@ -148,15 +148,9 @@ func (c *OKXRestClient) GetBalance(currency string) (*types.BalanceInfo, error) 
 	}
 	// Для получения баланса спотового аккаунта в Unified-режиме
 	queryParams = append(queryParams, "instType=SPOT")
-	
+
 	if len(queryParams) > 0 {
 		endpoint += "?" + strings.Join(queryParams, "&")
-	}
-
-	var response struct {
-		Code    string              `json:"code"`
-		Message string              `json:"msg"`
-		Data    []types.BalanceInfo `json:"data"`
 	}
 
 	// Создадим отдельный метод для получения raw-ответа
@@ -168,6 +162,11 @@ func (c *OKXRestClient) GetBalance(currency string) (*types.BalanceInfo, error) 
 	log.Printf("[BALANCE-RAW] %s", string(resp))
 
 	// Теперь распарсим ответ
+	var response struct {
+		Code    string              `json:"code"`
+		Message string              `json:"msg"`
+		Data    []types.BalanceInfo `json:"data"`
+	}
 	if err := json.Unmarshal(resp, &response); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
@@ -209,7 +208,7 @@ func (c *OKXRestClient) GetMarginBalance(currency string) (*types.BalanceInfo, e
 	}
 	// Для получения баланса маржинального аккаунта в Unified-режиме
 	queryParams = append(queryParams, "instType=MARGIN")
-	
+
 	if len(queryParams) > 0 {
 		endpoint += "?" + strings.Join(queryParams, "&")
 	}
@@ -329,20 +328,100 @@ func (c *OKXRestClient) CancelAlgoOrder(algoID, instID string) (bool, error) {
 	return resp.Code == "0", nil
 }
 
-// PlaceTrailingStop places a trailing stop order
-func (c *OKXRestClient) PlaceTrailingStop(instID string, closeSide types.OrderSide, size, activationPrice float64) (*types.OrderResponse, error) {
+// PlaceTrailingStop places a trailing stop order (native OKX 2025)
+func (c *OKXRestClient) PlaceTrailingStop(instID string, tdMode string, closeSide types.OrderSide, size, activationPrice, callbackRatio float64) (*types.AlgoOrderResponse, error) {
 	endpoint := fmt.Sprintf("/api/%s/trade/order-algo", APIVersion)
 
 	body := map[string]interface{}{
+		"instId":        instID,
+		"tdMode":        tdMode, // "cross" or "isolated"
+		"side":          string(closeSide),
+		"posSide":       mapPosSide(closeSide), // "long" / "short"
+		"ordType":       "move_order_stop",
+		"sz":            strconv.FormatFloat(size, 'f', -1, 64),
+		"activationPx":  strconv.FormatFloat(activationPrice, 'f', -1, 64),
+		"callbackRatio": strconv.FormatFloat(callbackRatio, 'f', -1, 64), // ratio (e.g. 0.015 = 1.5%)
+		"orderPx":       "-1", // market execution
+	}
+
+	// Create a separate send request function for algo orders to get proper response type
+	var response types.AlgoOrderResponse
+	err := c.sendRequestAndDecode("POST", endpoint, body, &response)
+	return &response, err
+}
+
+// mapPosSide maps the order side to position side
+func mapPosSide(s types.OrderSide) string {
+	if s == types.OrderSideBuy {
+		return "long"
+	}
+	return "short"
+}
+
+// AmendAlgoOrder amends an existing algorithmic order (stop-loss/take-profit)
+func (c *OKXRestClient) AmendAlgoOrder(instID, algoID, algoOrderType string, triggerPx, orderPx *float64) (*types.OrderResponse, error) {
+	endpoint := fmt.Sprintf("/api/%s/trade/amend-algos", APIVersion)
+
+	body := map[string]interface{}{
 		"instId":    instID,
-		"tdMode":    "isolated", // Isolated margin mode for futures
-		"side":      string(closeSide),
-		"ordType":   "move_order_stop",
-		"sz":        strconv.FormatFloat(size, 'f', -1, 64),
-		"triggerPx": strconv.FormatFloat(activationPrice, 'f', -1, 64),
+		"algoId":    algoID,
+		"ordType":   algoOrderType, // "conditional", "oco", "trigger", "move_order_stop"
+	}
+	
+	if triggerPx != nil {
+		body["triggerPx"] = strconv.FormatFloat(*triggerPx, 'f', -1, 64)
+	}
+	
+	// Handle market vs limit orders correctly
+	if orderPx != nil {
+		// For limit orders, include the specific price
+		body["ordPx"] = strconv.FormatFloat(*orderPx, 'f', -1, 64)
+	} else if triggerPx != nil {
+		// For market orders with a trigger price, set ordPx to "-1"
+		// This is needed for SL/TP orders that should execute at market price
+		body["ordPx"] = "-1"
 	}
 
 	return c.sendRequest("POST", endpoint, body)
+}
+
+// GetTrailingAlgoInfo retrieves trailing stop algo order information
+func (c *OKXRestClient) GetTrailingAlgoInfo(algoID, instID string) (activationPx, callbackRatio float64, err error) {
+	endpoint := fmt.Sprintf("/api/%s/trade/orders-algo-pending?algoId=%s&instId=%s", APIVersion, algoID, instID)
+	
+	var response struct {
+		Code string `json:"code"`
+		Msg  string `json:"msg"`
+		Data []struct {
+			AlgoID        string `json:"algoId"`
+			ActivationPx  string `json:"activationPx"`
+			CallbackRatio string `json:"callbackRatio"`
+		} `json:"data"`
+	}
+	
+	if err := c.sendRequestAndDecode("GET", endpoint, nil, &response); err != nil {
+		return 0, 0, err
+	}
+	
+	if response.Code != "0" {
+		return 0, 0, fmt.Errorf("API error: %s - %s", response.Code, response.Msg)
+	}
+	
+	if len(response.Data) == 0 {
+		return 0, 0, fmt.Errorf("no algo order found with ID: %s", algoID)
+	}
+	
+	activationPx, err = strconv.ParseFloat(response.Data[0].ActivationPx, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to parse activation price: %w", err)
+	}
+	
+	callbackRatio, err = strconv.ParseFloat(response.Data[0].CallbackRatio, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to parse callback ratio: %w", err)
+	}
+	
+	return activationPx, callbackRatio, nil
 }
 
 // GetOrderBook retrieves the order book for an instrument
@@ -353,8 +432,8 @@ func (c *OKXRestClient) GetOrderBook(instID string, size int) (*types.OrderBook,
 	}
 
 	var response struct {
-		Code    string         `json:"code"`
-		Message string         `json:"msg"`
+		Code    string            `json:"code"`
+		Message string            `json:"msg"`
 		Data    []types.OrderBook `json:"data"`
 	}
 
@@ -460,6 +539,9 @@ func (c *OKXRestClient) sendRequestAndDecode(method, endpoint string, body inter
 		return fmt.Errorf("failed to read response: %w", err)
 	}
 
+	// Log the full raw response for debugging
+	log.Printf("[OKX-RAW-RESPONSE] %s", string(respBody))
+
 	// Check for HTTP errors
 	if resp.StatusCode >= 400 {
 		var errorResp struct {
@@ -530,6 +612,9 @@ func (c *OKXRestClient) sendRequestAndReadRawResponse(method, endpoint string, b
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
+	// Log the full raw response for debugging
+	log.Printf("[OKX-RAW-RESPONSE] %s", string(respBody))
+
 	// Check for HTTP errors
 	if resp.StatusCode >= 400 {
 		var errorResp struct {
@@ -543,7 +628,64 @@ func (c *OKXRestClient) sendRequestAndReadRawResponse(method, endpoint string, b
 	return respBody, nil
 }
 
-	// GetFundingBalance returns USDT amount that really sits in funding account
+// SetLeverage sets the leverage for a specific instrument
+func (c *OKXRestClient) SetLeverage(instID, marginMode string, leverage int, posSide string) error {
+	body := map[string]interface{}{
+		"instId":  instID,
+		"lever":   strconv.Itoa(leverage),
+		"mgnMode": marginMode, // "cross" or "isolated"
+	}
+	if posSide != "" { // Adding posSide for hedge mode
+		body["posSide"] = posSide
+	}
+
+	resp, err := c.sendRequest("POST", "/api/v5/account/set-leverage", body)
+	if err != nil {
+		return fmt.Errorf("set leverage request failed: %w", err)
+	}
+
+	if resp.Code != "0" {
+		return fmt.Errorf("set leverage error: %s - %s", resp.Code, resp.Message)
+	}
+
+	log.Printf("✅ Set leverage to %d for %s in %s mode (posSide=%s)", leverage, instID, marginMode, posSide)
+	return nil
+}
+
+// TransferToMargin transfers funds from funding account to margin account
+func (c *OKXRestClient) TransferToMargin(ccy string, amt float64) error {
+	const minTransfer = 1.0 // OKX минимум 1 USDT на перевод
+	if amt < minTransfer {
+		return fmt.Errorf("transfer amt %.4f < min %.2f", amt, minTransfer)
+	}
+	body := map[string]interface{}{
+		"ccy":  ccy,
+		"amt":  fmt.Sprintf("%.6f", amt),
+		"from": "6",  // Funding
+		"to":   "18", // Isolated-margin
+	}
+
+	respBody, err := c.sendRequestAndReadRawResponse("POST", "/api/v5/asset/transfer", body)
+	if err != nil {
+		return fmt.Errorf("transfer request failed: %w", err)
+	}
+	log.Printf("[TRANSFER-RAW] %s", string(respBody))
+
+	var r struct {
+		Code string `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err = json.Unmarshal(respBody, &r); err != nil {
+		return fmt.Errorf("unmarshal transfer: %w", err)
+	}
+	if r.Code != "0" {
+		return fmt.Errorf("transfer error %s: %s", r.Code, r.Msg)
+	}
+	log.Printf("✅ Transferred %.4f %s funding→isolated", amt, ccy)
+	return nil
+}
+
+// GetFundingBalance returns USDT amount that really sits in funding account
 func (c *OKXRestClient) GetFundingBalance() (float64, error) {
 	type resp struct {
 		Code string `json:"code"`
@@ -569,95 +711,27 @@ func (c *OKXRestClient) GetFundingBalance() (float64, error) {
 	return strconv.ParseFloat(r.Data[0].Details[0].AvailBal, 64)
 }
 
-// SetLeverage sets the leverage for a specific instrument
-func (c *OKXRestClient) SetLeverage(instID, marginMode string, leverage int, posSide string) error {
-	body := map[string]interface{}{
-		"instId":  instID,
-		"lever":   strconv.Itoa(leverage),
-		"mgnMode": marginMode, // "cross" or "isolated"
-	}
-	if posSide != "" {              // ← NEW
-		body["posSide"] = posSide
-	}
-	
-	var response struct {
-		Code    string `json:"code"`
-		Message string `json:"msg"`
-		Data    []struct {
-			InstID    string `json:"instId"`
-			Lever     string `json:"lever"`
-			MgnMode   string `json:"mgnMode"`
-			PosSide   string `json:"posSide"`
-		} `json:"data"`
-	}
-	
-	_, err := c.sendRequest("POST", "/api/v5/account/set-leverage", body)
-	if err != nil {
-		return fmt.Errorf("set leverage request failed: %w", err)
-	}
-	
-	if response.Code != "0" {
-		return fmt.Errorf("set leverage error: %s - %s", response.Code, response.Message)
-	}
-	
-	log.Printf("✅ Set leverage to %d for %s in %s mode (posSide=%s)", leverage, instID, marginMode, posSide)
-	return nil
-}
-
-// TransferToMargin transfers funds from funding account to margin account
-func (c *OKXRestClient) TransferToMargin(ccy string, amt float64) error {
-	const minTransfer = 1.0 // OKX минимум 1 USDT на перевод
-	if amt < minTransfer {
-		return fmt.Errorf("transfer amt %.4f < min %.2f", amt, minTransfer)
-	}
-	body := map[string]interface{}{
-		"ccy":  ccy,
-		"amt":  fmt.Sprintf("%.6f", amt),
-		"from": "6", // Funding
-		"to":   "18", // Isolated-margin
-	}
-
-	respBody, err := c.sendRequestAndReadRawResponse("POST", "/api/v5/asset/transfer", body)
-	if err != nil {
-		return fmt.Errorf("transfer request failed: %w", err)
-	}
-	log.Printf("[TRANSFER-RAW] %s", string(respBody))
-
-	var r struct {
-		Code string `json:"code"`
-		Msg  string `json:"msg"`
-	}
-	if err = json.Unmarshal(respBody, &r); err != nil {
-		return fmt.Errorf("unmarshal transfer: %w", err)
-	}
-	if r.Code != "0" {
-		return fmt.Errorf("transfer error %s: %s", r.Code, r.Msg)
-	}
-	log.Printf("✅ Transferred %.4f %s funding→isolated", amt, ccy)
-	return nil
-}
-
 // Borrow borrows funds for margin trading
 func (c *OKXRestClient) Borrow(ccy string, amt float64) error {
 	body := map[string]interface{}{
 		"ccy": ccy,
 		"amt": fmt.Sprintf("%.6f", amt),
 	}
-	
+
 	var response struct {
 		Code    string `json:"code"`
 		Message string `json:"msg"`
 	}
-	
+
 	_, err := c.sendRequest("POST", "/api/v5/margin/borrow", body)
 	if err != nil {
 		return fmt.Errorf("borrow request failed: %w", err)
 	}
-	
+
 	if response.Code != "0" {
 		return fmt.Errorf("borrow error: %s - %s", response.Code, response.Message)
 	}
-	
+
 	log.Printf("✅ Borrowed %.6f %s", amt, ccy)
 	return nil
 }
