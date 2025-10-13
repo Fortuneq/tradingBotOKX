@@ -19,11 +19,10 @@ import (
 
 // TradingBot orchestrates market data, strategy, and order execution
 type TradingBot struct {
-	config               *config.Config
-	marketDataService30m marketdata.MarketDataService // 30m for volumes, TP, SL
-	marketDataService15m marketdata.MarketDataService // 15m for RSI and entries
-	restClient           *client.OKXRestClient
-	tradingStrategy      strategy.TradingStrategy
+	config            *config.Config
+	marketDataService marketdata.MarketDataService
+	restClient        *client.OKXRestClient
+	tradingStrategy   strategy.TradingStrategy
 
 	// State management
 	ctx       context.Context
@@ -53,30 +52,22 @@ func NewTradingBot(cfg *config.Config) (*TradingBot, error) {
 		cfg.OKX.Passphrase,
 	)
 
-	// Create market data services - dual timeframe approach
-	marketDataService30m := marketdata.NewOKXMarketDataService(
+	// Create market data service
+	marketDataService := marketdata.NewOKXMarketDataService(
 		cfg.OKX.InstrumentID,
-		cfg.OKX.Timeframe, // 30m for volumes, TP, SL
+		cfg.OKX.Timeframe,
 		cfg.OKX.APIKey,
 		cfg.OKX.APISecret,
 		cfg.OKX.Passphrase,
 	)
 
-	marketDataService15m := marketdata.NewOKXMarketDataService(
-		cfg.OKX.InstrumentID,
-		cfg.OKX.TimeframeRSI, // 15m for RSI and entry signals
-		cfg.OKX.APIKey,
-		cfg.OKX.APISecret,
-		cfg.OKX.Passphrase,
-	)
-
-	// Create trading strategy with dual timeframes
+	// Create trading strategy
 	advancedStrategy := strategy.NewAdvancedTradingStrategy(
-		marketDataService30m, // 30m for volumes, TP, SL
-		marketDataService15m, // 15m for RSI and entries
+		marketDataService,
 		restClient,
 		&cfg.Strategy,
 		cfg.OKX.InstrumentID,
+		cfg.OKX.Timeframe,
 		500, // buffer size
 	)
 
@@ -87,20 +78,17 @@ func NewTradingBot(cfg *config.Config) (*TradingBot, error) {
 	}
 
 	bot := &TradingBot{
-		config:               cfg,
-		marketDataService30m: marketDataService30m,
-		marketDataService15m: marketDataService15m,
-		restClient:           restClient,
-		tradingStrategy:      advancedStrategy,
-		trailingManager:      strategy.NewTrailingStopManager(restClient, cfg.OKX.InstrumentID, trailingConfig),
-		lastCandleTime:       time.Time{},
+		config:            cfg,
+		marketDataService: marketDataService,
+		restClient:        restClient,
+		tradingStrategy:   advancedStrategy,
+		trailingManager:   strategy.NewTrailingStopManager(restClient, cfg.OKX.InstrumentID, trailingConfig),
+		lastCandleTime:    time.Time{},
 	}
 
-	// Set up event handlers for both timeframes
-	marketDataService30m.SetOnPriceUpdate(bot.onPriceUpdate)
-	marketDataService30m.SetOnCandleUpdate(bot.onCandleUpdate30m)
-	marketDataService15m.SetOnPriceUpdate(bot.onPriceUpdate) // Same price updates
-	marketDataService15m.SetOnCandleUpdate(bot.onCandleUpdate15m)
+	// Set up event handlers
+	marketDataService.SetOnPriceUpdate(bot.onPriceUpdate)
+	marketDataService.SetOnCandleUpdate(bot.onCandleUpdate)
 	advancedStrategy.SetOnTradeSignal(bot.onTradeSignal)
 
 	// Set the trailing manager on the strategy
@@ -115,6 +103,9 @@ func NewTradingBot(cfg *config.Config) (*TradingBot, error) {
 		advancedStrategy.SetInitialBalance(balance.Equity)
 		log.Printf("📊 Initial balance set to %.2f USDT for fixed risk management", balance.Equity)
 	}
+
+	// Set up 30m candle handler - since marketDataService is already *OKXMarketDataService
+	marketDataService.SetOn30mCandle(bot.on30mCandle)
 
 	return bot, nil
 }
@@ -131,17 +122,11 @@ func (bot *TradingBot) Start(ctx context.Context) error {
 
 	bot.ctx, bot.cancel = context.WithCancel(ctx)
 
-	log.Println("🚀 Starting OKX Trading Bot with dual timeframes...")
+	log.Println("🚀 Starting OKX Trading Bot...")
 
-	// Initialize both market data services
-	log.Println("📊 Initializing 30m market data service...")
-	if err := bot.marketDataService30m.Initialize(bot.ctx); err != nil {
-		return fmt.Errorf("failed to initialize 30m market data service: %w", err)
-	}
-
-	log.Println("📊 Initializing 15m market data service...")
-	if err := bot.marketDataService15m.Initialize(bot.ctx); err != nil {
-		return fmt.Errorf("failed to initialize 15m market data service: %w", err)
+	// Initialize market data service
+	if err := bot.marketDataService.Initialize(bot.ctx); err != nil {
+		return fmt.Errorf("failed to initialize market data service: %w", err)
 	}
 
 	// Initialize trading strategy
@@ -158,7 +143,7 @@ func (bot *TradingBot) Start(ctx context.Context) error {
 	// No continuous timer needed anymore
 
 	log.Printf("✅ Trading Bot started for %s (Futures)", bot.config.OKX.InstrumentID)
-	log.Printf("📊 Real-time 30m candles for volumes/TP/SL, 15m candles for RSI/entries")
+	log.Printf("📊 Real-time %s candles via WebSocket", bot.config.OKX.Timeframe)
 	log.Println("🔄 Trailing stops updated in real-time on every price tick")
 
 	return nil
@@ -188,12 +173,9 @@ func (bot *TradingBot) Stop() error {
 
 	// NOTE: trailingTimer is no longer used, so no need to stop it
 
-	// Close both market data services
-	if err := bot.marketDataService30m.Close(); err != nil {
-		log.Printf("⚠️ Error closing 30m market data service: %v", err)
-	}
-	if err := bot.marketDataService15m.Close(); err != nil {
-		log.Printf("⚠️ Error closing 15m market data service: %v", err)
+	// Close market data service
+	if err := bot.marketDataService.Close(); err != nil {
+		log.Printf("⚠️ Error closing market data service: %v", err)
 	}
 
 	log.Println("✅ Trading bot stopped")
@@ -393,47 +375,6 @@ func (bot *TradingBot) onCandleUpdate(candle *types.Candle) {
 	bot.tradingStrategy.Update(candle)
 }
 
-// onCandleUpdate30m handles real-time 30m candle updates from WebSocket
-func (bot *TradingBot) onCandleUpdate30m(candle *types.Candle) {
-	// Skip if the candle has zero values (malformed or temporary data)
-	if candle.Close == 0 || candle.Volume == 0 {
-		log.Printf("⚠️ Received zero 30m candle, skipping: O:%.2f H:%.2f L:%.2f C:%.2f V:%.1f",
-			candle.Open, candle.High, candle.Low, candle.Close, candle.Volume)
-		return
-	}
-
-	// Update price from candle close
-	bot.priceMu.Lock()
-	bot.lastPrice = candle.Close
-	bot.priceMu.Unlock()
-
-	log.Printf("📊 New 30m candle: O:%.2f H:%.2f L:%.2f C:%.2f V:%.1f",
-		candle.Open, candle.High, candle.Low, candle.Close, candle.Volume)
-
-	// Process the 30m candle through the strategy (for volumes, TP, SL)
-	if advancedStrategy, ok := bot.tradingStrategy.(*strategy.AdvancedTradingStrategy); ok {
-		advancedStrategy.Update30m(candle)
-	}
-}
-
-// onCandleUpdate15m handles real-time 15m candle updates from WebSocket
-func (bot *TradingBot) onCandleUpdate15m(candle *types.Candle) {
-	// Skip if the candle has zero values (malformed or temporary data)
-	if candle.Close == 0 || candle.Volume == 0 {
-		log.Printf("⚠️ Received zero 15m candle, skipping: O:%.2f H:%.2f L:%.2f C:%.2f V:%.1f",
-			candle.Open, candle.High, candle.Low, candle.Close, candle.Volume)
-		return
-	}
-
-	log.Printf("📊 New 15m candle: O:%.2f H:%.2f L:%.2f C:%.2f V:%.1f",
-		candle.Open, candle.High, candle.Low, candle.Close, candle.Volume)
-
-	// Process the 15m candle through the strategy (for RSI and entry signals)
-	if advancedStrategy, ok := bot.tradingStrategy.(*strategy.AdvancedTradingStrategy); ok {
-		advancedStrategy.Update15m(candle)
-	}
-}
-
 // Global variables for trade counting
 var (
 	dailyTrades   int
@@ -459,13 +400,25 @@ func (bot *TradingBot) onTradeSignal(signal *types.TradeSignal) error {
 
 	// Increment daily trade counter
 	incrementDailyTrade()
-
+	
 	log.Printf("📈 Trade Signal: %s %.3f @ %.2f (Strategy: %s)",
 		signal.Side, signal.Size, signal.EntryPrice, signal.Strategy)
 
 	// The signal execution is handled within the strategy itself
 	// This is just for logging and monitoring
 	return nil
+}
+
+// on30mCandle handles 30-minute candle updates from WebSocket
+func (bot *TradingBot) on30mCandle(c30 *types.Candle) {
+	// пропускаем «нулевые» свечи
+	if c30.Close == 0 || c30.Volume == 0 {
+		return
+	}
+	// передаём в стратегию
+	if strat, ok := bot.tradingStrategy.(*strategy.AdvancedTradingStrategy); ok {
+		strat.On30mCandle(c30)
+	}
 }
 
 // WebSocketSilentTimeout определяет максимальное время ожидания новой свечи через WebSocket
@@ -499,7 +452,7 @@ func (bot *TradingBot) pollCandles() {
 
 // fetchAndProcessCandles fetches the latest candle and processes it
 func (bot *TradingBot) fetchAndProcessCandles() {
-	candles, err := bot.marketDataService30m.GetHistoricalData(1)
+	candles, err := bot.marketDataService.GetHistoricalData(1)
 	if err != nil {
 		log.Printf("❌ Failed to fetch candles: %v", err)
 		return
@@ -614,8 +567,8 @@ func (bot *TradingBot) processTrailingStops() {
 
 		// === ЛОГ: проверяем, что OKX действительно обновил трейлинг ===
 		if pos.StopLossAlgoID != "" {
-			activationPx, callbackRatio, err :=
-				bot.restClient.GetTrailingAlgoInfo(pos.StopLossAlgoID, bot.config.OKX.InstrumentID)
+			activationPx, callbackRatio, err := 
+		bot.restClient.GetTrailingAlgoInfo(pos.StopLossAlgoID, bot.config.OKX.InstrumentID)
 			if err == nil {
 				// Рассчитываем текущий эффективный SL
 				var effectiveSL float64
@@ -629,7 +582,7 @@ func (bot *TradingBot) processTrailingStops() {
 				if math.Abs(effectiveSL-pos.LastLoggedSL) > 0.001 {
 					log.Printf("✅ Trailing updated: SL %.5f → %.5f (peak=%.5f, callback=%.4f%%) algoID=%s",
 						pos.LastLoggedSL, effectiveSL, activationPx, callbackRatio*100,
-						pos.StopLossAlgoID)
+		pos.StopLossAlgoID)
 					pos.LastLoggedSL = effectiveSL
 				} else {
 					log.Printf("⏳ Trailing unchanged: SL %.5f (peak=%.5f, callback=%.4f%%)",

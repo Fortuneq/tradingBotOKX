@@ -60,6 +60,59 @@ func (s *AdvancedTradingStrategy) calculateRSI(closes []float64, period int) []f
 	return rsi
 }
 
+// calculateRSIWithPeriod calculates the Relative Strength Index with a custom period
+func calculateRSIWithPeriod(closes []float64, period int) []float64 {
+	if len(closes) < 2 || period <= 0 {
+		return []float64{}
+	}
+
+	rsi := make([]float64, len(closes))
+	var avgGain, avgLoss float64
+
+	// Calculate initial average gain and loss
+	for i := 1; i <= period; i++ {
+		diff := closes[i] - closes[i-1]
+		if diff > 0 {
+			avgGain += diff
+		} else {
+			avgLoss -= diff
+		}
+	}
+
+	avgGain /= float64(period)
+	avgLoss /= float64(period)
+
+	// Calculate first RSI value
+	if avgLoss == 0 {
+		rsi[period] = 100
+	} else {
+		rsi[period] = 100 - (100 / (1 + avgGain/avgLoss))
+	}
+
+	// Calculate subsequent RSI values using exponential moving average
+	for i := period + 1; i < len(closes); i++ {
+		diff := closes[i] - closes[i-1]
+		var gain, loss float64
+
+		if diff > 0 {
+			gain = diff
+		} else {
+			loss = -diff
+		}
+
+		avgGain = (avgGain*float64(period-1) + gain) / float64(period)
+		avgLoss = (avgLoss*float64(period-1) + loss) / float64(period)
+
+		if avgLoss == 0 {
+			rsi[i] = 100
+		} else {
+			rsi[i] = 100 - (100 / (1 + avgGain/avgLoss))
+		}
+	}
+
+	return rsi
+}
+
 // calculateATR calculates the Average True Range
 func (s *AdvancedTradingStrategy) calculateATR(highs, lows, closes []float64, period int) float64 {
 	if len(highs) < period || len(lows) < period || len(closes) < period {

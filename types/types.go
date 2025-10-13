@@ -380,6 +380,7 @@ type Position struct {
 	TrailOffset   float64  // Отступ для трейлинга (ATR * multiplier)
 	EntryATR      float64  // ATR на момент входа
 	LastLoggedSL  float64  `json:"-"` // последний залогированный уровень SL для трейлинга
+	TpReached     bool     `json:"-"` // флаг: коснулись TP
 }
 
 // TradingViewSignal represents a webhook signal from TradingView

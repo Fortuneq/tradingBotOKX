@@ -60,7 +60,7 @@ func main() {
 
 	// Create HTTP server
 	server := &http.Server{
-		Addr:         ":5500",
+		Addr:         ":5000",
 		Handler:      router,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
@@ -69,7 +69,7 @@ func main() {
 
 	// Start HTTP server in a goroutine
 	go func() {
-		log.Println("🌐 Starting HTTP server on :5500")
+		log.Println("🌐 Starting HTTP server on :5000")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("❌ HTTP server error: %v", err)
 		}

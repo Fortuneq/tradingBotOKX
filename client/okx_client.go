@@ -333,15 +333,15 @@ func (c *OKXRestClient) PlaceTrailingStop(instID string, tdMode string, closeSid
 	endpoint := fmt.Sprintf("/api/%s/trade/order-algo", APIVersion)
 
 	body := map[string]interface{}{
-		"instId": instID,
-		"tdMode": tdMode, // "cross" or "isolated"
-		"side":   string(closeSide),
-		// "posSide":       mapPosSide(closeSide), // НЕ НУЖЕН в Net Mode!
+		"instId":        instID,
+		"tdMode":        tdMode, // "cross" or "isolated"
+		"side":          string(closeSide),
+		"posSide":       mapPosSide(closeSide), // "long" / "short"
 		"ordType":       "move_order_stop",
 		"sz":            strconv.FormatFloat(size, 'f', -1, 64),
 		"activationPx":  strconv.FormatFloat(activationPrice, 'f', -1, 64),
 		"callbackRatio": strconv.FormatFloat(callbackRatio, 'f', -1, 64), // ratio (e.g. 0.015 = 1.5%)
-		"orderPx":       "-1",                                            // market execution
+		"orderPx":       "-1", // market execution
 	}
 
 	// Create a separate send request function for algo orders to get proper response type
@@ -363,15 +363,15 @@ func (c *OKXRestClient) AmendAlgoOrder(instID, algoID, algoOrderType string, tri
 	endpoint := fmt.Sprintf("/api/%s/trade/amend-algos", APIVersion)
 
 	body := map[string]interface{}{
-		"instId":  instID,
-		"algoId":  algoID,
-		"ordType": algoOrderType, // "conditional", "oco", "trigger", "move_order_stop"
+		"instId":    instID,
+		"algoId":    algoID,
+		"ordType":   algoOrderType, // "conditional", "oco", "trigger", "move_order_stop"
 	}
-
+	
 	if triggerPx != nil {
 		body["triggerPx"] = strconv.FormatFloat(*triggerPx, 'f', -1, 64)
 	}
-
+	
 	// Handle market vs limit orders correctly
 	if orderPx != nil {
 		// For limit orders, include the specific price
@@ -388,7 +388,7 @@ func (c *OKXRestClient) AmendAlgoOrder(instID, algoID, algoOrderType string, tri
 // GetTrailingAlgoInfo retrieves trailing stop algo order information
 func (c *OKXRestClient) GetTrailingAlgoInfo(algoID, instID string) (activationPx, callbackRatio float64, err error) {
 	endpoint := fmt.Sprintf("/api/%s/trade/orders-algo-pending?algoId=%s&instId=%s", APIVersion, algoID, instID)
-
+	
 	var response struct {
 		Code string `json:"code"`
 		Msg  string `json:"msg"`
@@ -398,29 +398,29 @@ func (c *OKXRestClient) GetTrailingAlgoInfo(algoID, instID string) (activationPx
 			CallbackRatio string `json:"callbackRatio"`
 		} `json:"data"`
 	}
-
+	
 	if err := c.sendRequestAndDecode("GET", endpoint, nil, &response); err != nil {
 		return 0, 0, err
 	}
-
+	
 	if response.Code != "0" {
 		return 0, 0, fmt.Errorf("API error: %s - %s", response.Code, response.Msg)
 	}
-
+	
 	if len(response.Data) == 0 {
 		return 0, 0, fmt.Errorf("no algo order found with ID: %s", algoID)
 	}
-
+	
 	activationPx, err = strconv.ParseFloat(response.Data[0].ActivationPx, 64)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to parse activation price: %w", err)
 	}
-
+	
 	callbackRatio, err = strconv.ParseFloat(response.Data[0].CallbackRatio, 64)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to parse callback ratio: %w", err)
 	}
-
+	
 	return activationPx, callbackRatio, nil
 }
 
