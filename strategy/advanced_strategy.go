@@ -563,16 +563,19 @@ type TradingStrategy interface {
 	SetTrailingManager(interface{})
 }
 
-// AdvancedTradingStrategy implements RSI + VWAP rejection strategy
+// AdvancedTradingStrategy implements RSI + VWAP rejection strategy with dual timeframes
 type AdvancedTradingStrategy struct {
-	marketDataService marketdata.MarketDataService
-	restClient        *client.OKXRestClient
-	config            *config.StrategyConfig
-	instrumentID      string
+	// Market data services - dual timeframe approach
+	marketDataService    marketdata.MarketDataService // 30m for volumes, TP, SL
+	marketDataService15m marketdata.MarketDataService // 15m for RSI and entry signals
+	restClient           *client.OKXRestClient
+	config               *config.StrategyConfig
+	instrumentID         string
 
 	// Circular buffers for historical data
-	candleBuffer *CircularBuffer[*types.Candle]
-	priceBuffer  *CircularBuffer[float64]
+	candleBuffer    *CircularBuffer[*types.Candle] // 30m candles
+	candleBuffer15m *CircularBuffer[*types.Candle] // 15m candles for RSI
+	priceBuffer     *CircularBuffer[float64]
 
 	// Position management
 	activePositions map[string]*types.Position
@@ -617,23 +620,26 @@ type AdvancedTradingStrategy struct {
 	initialBalance float64 // начальный баланс для фиксированного риска
 }
 
-// NewAdvancedTradingStrategy creates a new advanced trading strategy
+// NewAdvancedTradingStrategy creates a new advanced trading strategy with dual timeframes
 func NewAdvancedTradingStrategy(
 	marketDataService marketdata.MarketDataService,
+	marketDataService15m marketdata.MarketDataService,
 	restClient *client.OKXRestClient,
 	cfg *config.StrategyConfig,
 	instrumentID string,
 	bufferSize int,
 ) *AdvancedTradingStrategy {
 	return &AdvancedTradingStrategy{
-		marketDataService: marketDataService,
-		restClient:        restClient,
-		config:            cfg,
-		instrumentID:      instrumentID,
-		candleBuffer:      NewCircularBuffer[*types.Candle](bufferSize),
-		priceBuffer:       NewCircularBuffer[float64](bufferSize),
-		activePositions:   make(map[string]*types.Position),
-		closedPositions:   make([]*types.Position, 0),
+		marketDataService:    marketDataService,    // 30m
+		marketDataService15m: marketDataService15m, // 15m for RSI
+		restClient:           restClient,
+		config:               cfg,
+		instrumentID:         instrumentID,
+		candleBuffer:         NewCircularBuffer[*types.Candle](bufferSize),
+		candleBuffer15m:      NewCircularBuffer[*types.Candle](bufferSize),
+		priceBuffer:          NewCircularBuffer[float64](bufferSize),
+		activePositions:      make(map[string]*types.Position),
+		closedPositions:      make([]*types.Position, 0),
 
 		// Strategy parameters
 		rsiLength:           cfg.RSILength,
@@ -757,23 +763,40 @@ func (s *AdvancedTradingStrategy) SetOnTradeSignal(callback func(*types.TradeSig
 
 // Initialize initializes the strategy with historical data
 func (s *AdvancedTradingStrategy) Initialize(ctx context.Context) error {
-	log.Println("Initializing trading strategy...")
+	log.Println("Initializing trading strategy with dual timeframes...")
 
-	historicalData, err := s.marketDataService.GetHistoricalData(50)
+	// Load 30m historical data for volumes, TP, SL
+	historicalData30m, err := s.marketDataService.GetHistoricalData(50)
 	if err != nil {
-		return fmt.Errorf("failed to get historical data: %w", err)
+		return fmt.Errorf("failed to get 30m historical data: %w", err)
 	}
 
-	for i, candle := range historicalData {
+	for i, candle := range historicalData30m {
 		// ⚠️  ПРОПУСКАЕМ последнюю свечу, если она ещё не закрыта
-		if i == len(historicalData)-1 && !candle.IsCompleted() {
-			log.Printf("⚠️  Skip incomplete warm-up candle: %v", candle.Timestamp)
+		if i == len(historicalData30m)-1 && !candle.IsCompleted() {
+			log.Printf("⚠️  Skip incomplete 30m warm-up candle: %v", candle.Timestamp)
 			continue
 		}
 		s.candleBuffer.PushBack(candle)
 	}
 
-	log.Printf("📊 Loaded %d historical candles", s.candleBuffer.Size())
+	// Load 15m historical data for RSI and entry signals
+	historicalData15m, err := s.marketDataService15m.GetHistoricalData(100) // More data for RSI calculation
+	if err != nil {
+		return fmt.Errorf("failed to get 15m historical data: %w", err)
+	}
+
+	for i, candle := range historicalData15m {
+		// ⚠️  ПРОПУСКАЕМ последнюю свечу, если она ещё не закрыта
+		if i == len(historicalData15m)-1 && !candle.IsCompleted() {
+			log.Printf("⚠️  Skip incomplete 15m warm-up candle: %v", candle.Timestamp)
+			continue
+		}
+		s.candleBuffer15m.PushBack(candle)
+	}
+
+	log.Printf("📊 Loaded %d historical 30m candles and %d historical 15m candles",
+		s.candleBuffer.Size(), s.candleBuffer15m.Size())
 
 	// Check for any existing positions on the exchange
 	log.Println("🔍 Checking for existing positions on exchange...")
@@ -936,6 +959,140 @@ func (s *AdvancedTradingStrategy) Update(candle *types.Candle) {
 				currentBarIndex := s.candleBuffer.Size() - 2 // ← -2  (previous COMPLETED bar)
 				s.lastSignalBarIndex = &currentBarIndex
 			}
+		}
+	}
+
+	// Update RSI state for next iteration
+	s.prevRSI = currentRSI
+}
+
+// Update30m processes new 30m candle data for volumes, TP, and SL calculations
+func (s *AdvancedTradingStrategy) Update30m(candle *types.Candle) {
+	// Skip if the candle has zero values
+	if candle.Close == 0 || candle.Volume == 0 {
+		log.Printf("⚠️ Zero 30m candle in strategy, skipping: O:%.2f H:%.2f L:%.2f C:%.2f V:%.1f",
+			candle.Open, candle.High, candle.Low, candle.Close, candle.Volume)
+		return
+	}
+
+	s.currentPrice = candle.Close
+	s.candleBuffer.PushBack(candle)
+
+	// Update position management
+	s.checkStopConditions(candle.Close)
+	s.updateTrailingStops(candle.Close)
+	s.checkPositionTimeouts()
+
+	log.Printf("[30m] %s | O=%.2f H:%.2f L:%.2f C=%.2f V=%.2f",
+		candle.Timestamp.Format("15:04:05"),
+		candle.Open, candle.High, candle.Low, candle.Close, candle.QuoteVolume)
+}
+
+// Update15m processes new 15m candle data for RSI calculations and entry signals
+func (s *AdvancedTradingStrategy) Update15m(candle *types.Candle) {
+	// Skip if the candle has zero values
+	if candle.Close == 0 || candle.Volume == 0 {
+		log.Printf("⚠️ Zero 15m candle in strategy, skipping: O:%.2f H:%.2f L:%.2f C:%.2f V:%.1f",
+			candle.Open, candle.High, candle.Low, candle.Close, candle.Volume)
+		s.prevRSI = 0 // Reset RSI state
+		return
+	}
+
+	// Add to 15m buffer
+	s.candleBuffer15m.PushBack(candle)
+
+	// Calculate RSI using 15m data
+	candles15m := s.candleBuffer15m.ToSlice()
+	closes15m := make([]float64, len(candles15m))
+	for i, c := range candles15m {
+		closes15m[i] = c.Close
+	}
+
+	rsi := []float64{}
+	if len(closes15m) >= s.rsiLength {
+		rsi = s.calculateRSI(closes15m, s.rsiLength)
+	}
+
+	currentRSI := 0.0
+	if len(rsi) > 0 {
+		currentRSI = rsi[len(rsi)-1]
+	}
+
+	// Get 30m data for VWAP, ATR, volumes, TP/SL calculations
+	candles30m := s.candleBuffer.ToSlice()
+	if len(candles30m) == 0 {
+		log.Printf("⚠️ No 30m data available for VWAP/ATR calculation")
+		s.prevRSI = currentRSI
+		return
+	}
+
+	vwap := s.calculateDailyVWAP(candles30m)
+	closes30m := make([]float64, len(candles30m))
+	highs30m := make([]float64, len(candles30m))
+	lows30m := make([]float64, len(candles30m))
+
+	for i, c := range candles30m {
+		closes30m[i] = c.Close
+		highs30m[i] = c.High
+		lows30m[i] = c.Low
+	}
+
+	atr := 0.0
+	if len(closes30m) >= s.atrLength {
+		atr = s.calculateATR(highs30m, lows30m, closes30m, s.atrLength)
+	}
+
+	log.Printf("[15m] %s | O=%.2f H:%.2f L:%.2f C=%.2f V=%.2f | RSI=%.2f VWAP=%.2f ATR=%.4f",
+		candle.Timestamp.Format("15:04:05"),
+		candle.Open, candle.High, candle.Low, candle.Close, candle.QuoteVolume,
+		currentRSI, vwap, atr)
+
+	// Need at least 2 15m candles for RSI comparison
+	if s.candleBuffer15m.Size() < 2 || len(rsi) < 2 {
+		s.prevRSI = currentRSI
+		return
+	}
+
+	// Check for RSI crossovers using 15m data
+	crossOver := false
+	crossUnder := false
+	if s.prevRSI > 0 {
+		crossOver = s.prevRSI <= s.rsiOversold && currentRSI > s.rsiOversold
+		crossUnder = s.prevRSI >= s.rsiOverbought && currentRSI < s.rsiOverbought
+	}
+
+	// RSI cooldown filter
+	if crossOver && s.lastSignalBarIndex != nil && s.candleBuffer15m.Size()-*s.lastSignalBarIndex <= s.cooldownBars {
+		crossOver = false
+	}
+	if crossUnder && s.lastSignalBarIndex != nil && s.candleBuffer15m.Size()-*s.lastSignalBarIndex <= s.cooldownBars {
+		crossUnder = false
+	}
+
+	// Use the last completed 30m candle for VWAP rejection analysis
+	if len(candles30m) >= 2 {
+		prevCandle30m := candles30m[len(candles30m)-2] // Last completed 30m candle
+
+		// Calculate rejection patterns using 30m candle
+		bearishRejection := prevCandle30m.Close > vwap // цена выше VWAP на предыдущей свече
+		bullishRejection := prevCandle30m.Close < vwap // цена ниже VWAP на предыдущей свече
+
+		canTrade := s.canTrade(prevCandle30m)
+
+		log.Printf("[15m STRATEGY] RSI=%.2f, VWAP=%.2f, ATR=%.4f | Conditions - RSI_Cross: %t, RSI_Crossunder: %t, Bullish(rej.): %t, Bearish(rej.): %t, CanTrade: %t",
+			currentRSI, vwap, atr, crossOver, crossUnder, bullishRejection, bearishRejection, canTrade)
+
+		// Generate signals using 15m RSI crossover + 30m VWAP rejection
+		if canTrade && crossOver && bullishRejection {
+			log.Printf("✅ LONG SIGNAL: RSI(%.2f) crossed up(%.2f), Bullish Rejection, Volume: %.2f", currentRSI, s.rsiOversold, prevCandle30m.Volume)
+			go s.GenerateSignal(types.OrderSideBuy, prevCandle30m, atr, vwap, "RSI15m+VWAP30m")
+			currentBarIndex := s.candleBuffer15m.Size() - 1 // Current 15m bar
+			s.lastSignalBarIndex = &currentBarIndex
+		} else if canTrade && crossUnder && bearishRejection {
+			log.Printf("✅ SHORT SIGNAL: RSI(%.2f) crossed down(%.2f), Bearish Rejection, Volume: %.2f", currentRSI, s.rsiOverbought, prevCandle30m.Volume)
+			go s.GenerateSignal(types.OrderSideSell, prevCandle30m, atr, vwap, "RSI15m+VWAP30m")
+			currentBarIndex := s.candleBuffer15m.Size() - 1 // Current 15m bar
+			s.lastSignalBarIndex = &currentBarIndex
 		}
 	}
 
