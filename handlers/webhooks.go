@@ -217,7 +217,7 @@ func (h *WebhookHandlers) handleManualTrade(w http.ResponseWriter, r *http.Reque
 func (h *WebhookHandlers) handleAllInTrade(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		Side string  `json:"side"`
-		Size float64 `json:"size"`  // включаем на всякий случай, но не используем
+		Size float64 `json:"size"` // включаем на всякий случай, но не используем
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {

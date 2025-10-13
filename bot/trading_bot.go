@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
+	"math/rand"
 	"strconv"
 	"sync"
 	"time"
@@ -36,6 +38,9 @@ type TradingBot struct {
 	// Control flags
 	running bool
 	mu      sync.RWMutex
+
+	// Trailing stop manager
+	trailingManager *strategy.TrailingStopManager
 }
 
 // NewTradingBot creates a new trading bot instance
@@ -57,26 +62,50 @@ func NewTradingBot(cfg *config.Config) (*TradingBot, error) {
 	)
 
 	// Create trading strategy
-	tradingStrategy := strategy.NewAdvancedTradingStrategy(
+	advancedStrategy := strategy.NewAdvancedTradingStrategy(
 		marketDataService,
 		restClient,
 		&cfg.Strategy,
 		cfg.OKX.InstrumentID,
+		cfg.OKX.Timeframe,
 		500, // buffer size
 	)
+
+	// Create trailing stop manager
+	trailingConfig := &strategy.TrailingConfig{
+		Enabled:       cfg.Strategy.UseTrailingStop,
+		CallbackRatio: cfg.Strategy.TrailingPercent / 100.0,
+	}
 
 	bot := &TradingBot{
 		config:            cfg,
 		marketDataService: marketDataService,
 		restClient:        restClient,
-		tradingStrategy:   tradingStrategy,
+		tradingStrategy:   advancedStrategy,
+		trailingManager:   strategy.NewTrailingStopManager(restClient, cfg.OKX.InstrumentID, trailingConfig),
 		lastCandleTime:    time.Time{},
 	}
 
 	// Set up event handlers
 	marketDataService.SetOnPriceUpdate(bot.onPriceUpdate)
 	marketDataService.SetOnCandleUpdate(bot.onCandleUpdate)
-	tradingStrategy.SetOnTradeSignal(bot.onTradeSignal)
+	advancedStrategy.SetOnTradeSignal(bot.onTradeSignal)
+
+	// Set the trailing manager on the strategy
+	advancedStrategy.SetTrailingManager(bot.trailingManager)
+
+	// Get and set initial balance for fixed risk management
+	balance, err := restClient.GetBalance("USDT")
+	if err != nil {
+		log.Printf("⚠️ Could not get initial balance: %v", err)
+		// If we can't get the initial balance, we'll rely on the strategy to use current balance as fallback
+	} else {
+		advancedStrategy.SetInitialBalance(balance.Equity)
+		log.Printf("📊 Initial balance set to %.2f USDT for fixed risk management", balance.Equity)
+	}
+
+	// Set up 30m candle handler - since marketDataService is already *OKXMarketDataService
+	marketDataService.SetOn30mCandle(bot.on30mCandle)
 
 	return bot, nil
 }
@@ -110,13 +139,12 @@ func (bot *TradingBot) Start(ctx context.Context) error {
 	// bot.candlePoller = time.NewTicker(5 * time.Second)
 	// go bot.pollCandles()
 
-	// Start trailing stop updates (every 1 second)
-	bot.trailingTimer = time.NewTicker(1 * time.Second)
-	go bot.updateTrailingStopsOnExchange()
+	// NOTE: Trailing stops are now updated directly on price updates from WebSocket ticks
+	// No continuous timer needed anymore
 
 	log.Printf("✅ Trading Bot started for %s (Futures)", bot.config.OKX.InstrumentID)
 	log.Printf("📊 Real-time %s candles via WebSocket", bot.config.OKX.Timeframe)
-	log.Println("🔄 Trailing stops updated every 1 second")
+	log.Println("🔄 Trailing stops updated in real-time on every price tick")
 
 	return nil
 }
@@ -143,9 +171,7 @@ func (bot *TradingBot) Stop() error {
 		bot.candlePoller.Stop()
 	}
 
-	if bot.trailingTimer != nil {
-		bot.trailingTimer.Stop()
-	}
+	// NOTE: trailingTimer is no longer used, so no need to stop it
 
 	// Close market data service
 	if err := bot.marketDataService.Close(); err != nil {
@@ -172,17 +198,17 @@ func (bot *TradingBot) PlaceManualOrder(side types.OrderSide, size float64) (boo
 	if orderType == "" {
 		orderType = "market" // default to market if not specified
 	}
-	
+
 	// Check for low liquidity by attempting to get order book
 	orderBook, err := bot.restClient.GetOrderBook(bot.config.OKX.InstrumentID, 1) // Get top of book
 	lowLiquidity := err != nil || len(orderBook.Asks) == 0 || len(orderBook.Bids) == 0
-	
+
 	// If order book is empty or error occurred, it's low liquidity situation
 	if lowLiquidity && orderType == "limit" {
 		log.Printf("⚠️ Low liquidity detected - switching to market order for %s", side)
 		orderType = "market" // Force market order when liquidity is low
 	}
-	
+
 	// Calculate limit price if order type is limit
 	var price *float64 = nil
 	if orderType == "limit" {
@@ -204,7 +230,7 @@ func (bot *TradingBot) PlaceManualOrder(side types.OrderSide, size float64) (boo
 		} else {
 			// Use prices from the order book
 			if side == types.OrderSideBuy {
-				// For buy orders, use the best ask price (lowest sell price) 
+				// For buy orders, use the best ask price (lowest sell price)
 				askPriceStr := orderBook.Asks[0][0] // First element is price
 				askPrice, err := strconv.ParseFloat(askPriceStr, 64)
 				if err != nil {
@@ -231,28 +257,36 @@ func (bot *TradingBot) PlaceManualOrder(side types.OrderSide, size float64) (boo
 				}
 			}
 		}
-		
+
 		// Проверяем минимальный номинал для лимитных ордеров
 		// OKX требует минимальный номинал ~20 USDT для лимитных ордеров на фьючерсах
-		minNotional := 20.0 // OKX лимит для QTUM-USDT-SWAP
+		minNotional := 20.0       // OKX лимит для QTUM-USDT-SWAP
 		notional := size * *price // номинал = размер * цена
-		
+
 		if notional < minNotional {
 			log.Printf("⚠️  Лимитный номинал %.2f < %.2f USDT – переключаемся на рыночный", notional, minNotional)
 			orderType = "market" // переключаемся на рыночный ордер
-			price = nil // у рыночного ордера цена не указывается
+			price = nil          // у рыночного ордера цена не указывается
 		} else {
 			log.Printf("📊 Manual limit price calculated: %.4f for %s order (nominal: %.2f USDT)", *price, side, notional)
 		}
 	}
-	
+
+	// Determine posSide based on order side
+	posSide := "long"
+	if side == types.OrderSideSell {
+		posSide = "short"
+	}
+
 	order := &types.OrderRequest{
 		InstID:    bot.config.OKX.InstrumentID,
 		TdMode:    "cross", // Cross margin mode for futures trading
 		Side:      side,
+		PosSide:   posSide, // Position side: long/short
 		OrderType: orderType,
 		Size:      size,
 		Price:     price,
+		ClOrdID:   fmt.Sprintf("bot%d%04d", time.Now().Unix(), rand.Intn(10000)),
 	}
 
 	response, err := bot.restClient.PlaceOrder(order)
@@ -261,6 +295,8 @@ func (bot *TradingBot) PlaceManualOrder(side types.OrderSide, size float64) (boo
 	}
 
 	if response.Code == "0" {
+		// Increment daily trade counter
+		incrementDailyTrade()
 		log.Printf("✅ Manual order: %s %.3f %s", side, size, bot.config.OKX.InstrumentID)
 		return true, nil
 	}
@@ -304,6 +340,12 @@ func (bot *TradingBot) onPriceUpdate(price float64) {
 	bot.priceMu.Lock()
 	bot.lastPrice = price
 	bot.priceMu.Unlock()
+
+	// Update trailing stops through the manager
+	positions := bot.tradingStrategy.GetPositions()
+	if err := bot.trailingManager.UpdateTrailingStops(positions, price); err != nil {
+		log.Printf("⚠️ Trailing update error: %v", err)
+	}
 }
 
 // onCandleUpdate handles real-time candle updates from WebSocket
@@ -333,12 +375,32 @@ func (bot *TradingBot) onCandleUpdate(candle *types.Candle) {
 	bot.tradingStrategy.Update(candle)
 }
 
+// Global variables for trade counting
+var (
+	dailyTrades   int
+	lastTradeDate string
+)
+
+// incrementDailyTrade increments the daily trade counter
+func incrementDailyTrade() {
+	currentDate := time.Now().Format("2006-01-02")
+	if currentDate != lastTradeDate {
+		dailyTrades = 0
+		lastTradeDate = currentDate
+	}
+	dailyTrades++
+	log.Printf("📊 Trade #%d today", dailyTrades)
+}
+
 // onTradeSignal handles trading signals from the strategy
 func (bot *TradingBot) onTradeSignal(signal *types.TradeSignal) error {
 	if signal.Size <= 0 {
 		return nil
 	}
 
+	// Increment daily trade counter
+	incrementDailyTrade()
+	
 	log.Printf("📈 Trade Signal: %s %.3f @ %.2f (Strategy: %s)",
 		signal.Side, signal.Size, signal.EntryPrice, signal.Strategy)
 
@@ -347,8 +409,20 @@ func (bot *TradingBot) onTradeSignal(signal *types.TradeSignal) error {
 	return nil
 }
 
+// on30mCandle handles 30-minute candle updates from WebSocket
+func (bot *TradingBot) on30mCandle(c30 *types.Candle) {
+	// пропускаем «нулевые» свечи
+	if c30.Close == 0 || c30.Volume == 0 {
+		return
+	}
+	// передаём в стратегию
+	if strat, ok := bot.tradingStrategy.(*strategy.AdvancedTradingStrategy); ok {
+		strat.On30mCandle(c30)
+	}
+}
+
 // WebSocketSilentTimeout определяет максимальное время ожидания новой свечи через WebSocket
-const WebSocketSilentTimeout = 6 * time.Minute
+const WebSocketSilentTimeout = 30 * time.Second
 
 // pollCandles periodically fetches and processes new candle data
 func (bot *TradingBot) pollCandles() {
@@ -419,76 +493,105 @@ func (bot *TradingBot) updateTrailingStopsOnExchange() {
 	}
 }
 
-// processTrailingStops processes trailing stop updates
+// processTrailingStops processes trailing stop updates - now using native OKX move_order_stop
 func (bot *TradingBot) processTrailingStops() {
-	bot.priceMu.RLock()
-	currentPrice := bot.lastPrice
-	bot.priceMu.RUnlock()
-
-	if currentPrice <= 0 {
-		return // No price data yet
-	}
-
 	positions := bot.tradingStrategy.GetPositions()
 	for _, pos := range positions {
 		if pos.Status != types.PositionStatusOpen || !pos.IsTrailingStop {
 			continue
 		}
 
-		// Calculate new stop level
-		var newStop float64
-		if pos.Side == types.OrderSideBuy {
-			newStop = currentPrice * (1 - bot.config.Strategy.TrailingPercent/100.0)
-		} else {
-			newStop = currentPrice * (1 + bot.config.Strategy.TrailingPercent/100.0)
-		}
-
-		// Only update if the new stop is better
-		shouldUpdate := false
-		if pos.Side == types.OrderSideBuy && newStop > pos.StopLoss {
-			shouldUpdate = true
-		} else if pos.Side == types.OrderSideSell && newStop < pos.StopLoss {
-			shouldUpdate = true
-		}
-
-		if !shouldUpdate || newStop == pos.StopLoss {
-			continue
-		}
-
-		// Cancel existing algo order and place new one
-		if pos.StopLossAlgoID != "" {
-			if success, err := bot.restClient.CancelAlgoOrder(pos.StopLossAlgoID, bot.config.OKX.InstrumentID); err != nil || !success {
-				log.Printf("⚠️ Failed to cancel trailing stop: %v", err)
-				continue
+		// === ЖИВОЙ ЛОГ: проверяем трейлинг каждую секунду ===
+		if pos.StopLossAlgoID != "" && pos.IsTrailingStop {
+			activationPx, callbackRatio, err := bot.restClient.GetTrailingAlgoInfo(pos.StopLossAlgoID, bot.config.OKX.InstrumentID)
+			if err == nil {
+				var effectiveSL float64 // для лонга
+				if pos.Side == types.OrderSideBuy {
+					effectiveSL = activationPx * (1 - callbackRatio) // для лонга
+				} else {
+					effectiveSL = activationPx * (1 + callbackRatio) // для шорта
+				}
+				log.Printf("⏳ Trailing check: peak=%.5f  callback=%.4f%%  effectiveSL=%.5f  last=%.5f",
+					activationPx, callbackRatio*100, effectiveSL, bot.GetLastPrice())
+			} else {
+				log.Printf("⚠ Trailing check failed: %v", err)
 			}
 		}
 
-		// Place new trailing stop
-		var closeSide types.OrderSide
-		if pos.Side == types.OrderSideBuy {
-			closeSide = types.OrderSideSell
-		} else {
-			closeSide = types.OrderSideBuy
-		}
-
-		algoOrder := &types.AlgoOrderRequest{
-			InstID:     bot.config.OKX.InstrumentID,
-			TdMode:     "cash", // Spot trading mode
-			Side:       closeSide,
-			Size:       pos.Size,
-			StopLoss:   newStop,
-			TakeProfit: 0, // Only stop loss for trailing
-			OrderType:  "conditional",
-		}
-
-		response, err := bot.restClient.PlaceAlgoOrder(algoOrder)
-		if err != nil || response.Code != "0" {
-			log.Printf("⚠️ Failed to place new trailing stop: %v", err)
+		// === Уже есть algoID? → пропускаем ===
+		if pos.StopLossAlgoID != "" {
 			continue
 		}
 
-		// Update position with new algo ID (this would need to be implemented in strategy)
-		log.Printf("✅ Updated trailing stop for %s: %.2f -> %.2f", pos.ID, pos.StopLoss, newStop)
+		// === Параметры ===
+		var closeSide types.OrderSide
+		var activationPx float64
+		if pos.Side == types.OrderSideBuy {
+			closeSide = types.OrderSideSell
+			activationPx = pos.PeakPrice // highest since entry
+		} else {
+			closeSide = types.OrderSideBuy
+			activationPx = pos.PeakPrice // lowest since entry
+		}
+
+		// Check if PeakPrice is valid, if not, use EntryPrice as fallback
+		if activationPx <= 0 {
+			activationPx = pos.EntryPrice
+		}
+
+		// === Ставим нативный трейлинг 1.5 % ===
+		callbackRatio := bot.config.Strategy.TrailingPercent / 100.0 // e.g. 0.015 for 1.5%
+		tdMode := bot.config.Strategy.TdMode
+		if tdMode == "" {
+			tdMode = "cross" // Default to cross margin mode
+		}
+		resp, err := bot.restClient.PlaceTrailingStop(
+			bot.config.OKX.InstrumentID,
+			tdMode,
+			closeSide,
+			pos.Size,
+			activationPx,
+			callbackRatio, // 0.015
+		)
+		if err != nil || resp.Code != "0" {
+			log.Printf("⚠️ Trailing stop failed: %v", err)
+			continue
+		}
+
+		// === Сохраняем ID ===
+		if len(resp.Data) > 0 {
+			pos.StopLossAlgoID = resp.Data[0].AlgoID
+		}
+		log.Printf("✅ Trailing stop set: activation=%.2f callback=%.1f%% algoID=%s",
+			activationPx, callbackRatio, pos.StopLossAlgoID)
+
+		// === ЛОГ: проверяем, что OKX действительно обновил трейлинг ===
+		if pos.StopLossAlgoID != "" {
+			activationPx, callbackRatio, err := 
+		bot.restClient.GetTrailingAlgoInfo(pos.StopLossAlgoID, bot.config.OKX.InstrumentID)
+			if err == nil {
+				// Рассчитываем текущий эффективный SL
+				var effectiveSL float64
+				if pos.Side == types.OrderSideBuy {
+					effectiveSL = activationPx * (1 - callbackRatio)
+				} else {
+					effectiveSL = activationPx * (1 + callbackRatio)
+				}
+
+				// Логируем только если изменился
+				if math.Abs(effectiveSL-pos.LastLoggedSL) > 0.001 {
+					log.Printf("✅ Trailing updated: SL %.5f → %.5f (peak=%.5f, callback=%.4f%%) algoID=%s",
+						pos.LastLoggedSL, effectiveSL, activationPx, callbackRatio*100,
+		pos.StopLossAlgoID)
+					pos.LastLoggedSL = effectiveSL
+				} else {
+					log.Printf("⏳ Trailing unchanged: SL %.5f (peak=%.5f, callback=%.4f%%)",
+						effectiveSL, activationPx, callbackRatio*100)
+				}
+			} else {
+				log.Printf("⚠ Cannot fetch trailing info: %v", err)
+			}
+		}
 	}
 }
 

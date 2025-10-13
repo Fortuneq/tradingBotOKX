@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
+	"time"
 
 	"okx-trading-bot/client"
 	"okx-trading-bot/types"
@@ -40,20 +42,28 @@ func (e *AllInExecutor) EnterLongShort(ctx context.Context, side types.OrderSide
 	price := tick.Last
 
 	// 5. Размер контракта (OKX: 1 контракт = 1.0 QTUM для фьючерсов)
-	contractVal := 1.0 // минимальный размер для QTUM фьючерса
-	maxSize := (avail - 0.5) / price // вычитаем 0.5 на комиссии
+	contractVal := 1.0                                    // минимальный размер для QTUM фьючерса
+	maxSize := (avail - 0.5) / price                      // вычитаем 0.5 на комиссии
 	size := math.Floor(maxSize/contractVal) * contractVal // округляем вниз до 1.0
 	if size < contractVal {
 		size = contractVal
 	}
 
-	// 4. Рыночный ордер в режиме «cash» (1×)
+	// 4. Рыночный ордер в режиме «cross» для фьючерсов (1×)
+	// Determine posSide based on order side
+	posSide := "long"
+	if side == types.OrderSideSell {
+		posSide = "short"
+	}
+
 	order := &types.OrderRequest{
 		InstID:    e.instID,
-		TdMode:    "cash",        // ← без плеча
+		TdMode:    "cross", // ← используем cross для фьючерсов
 		Side:      side,
+		PosSide:   posSide, // Position side: long/short
 		OrderType: "market",
 		Size:      size,
+		ClOrdID:   fmt.Sprintf("allin%d%04d", time.Now().Unix(), rand.Intn(10000)), // Unique client order ID
 	}
 	resp, err := e.rest.PlaceOrder(order)
 	if err != nil {

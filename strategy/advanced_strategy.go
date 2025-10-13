@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
 	"strconv"
 	"sync"
 	"time"
@@ -15,7 +16,482 @@ import (
 	"okx-trading-bot/types"
 )
 
+// enterWithSLTP входит на 70 % баланса и сразу вешает SL/TP через attach-algo
+func (s *AdvancedTradingStrategy) enterWithSLTP(side types.OrderSide, candle *types.Candle, atr float64) error {
+    log.Printf("🔍 enterWithSLTP: started, side=%s, atr=%.4f, candle=(H:%.4f, L:%.4f, C:%.4f)", 
+        side, atr, candle.High, candle.Low, candle.Close)
+    
+    // 1. Текущая цена
+    ticker, err := s.restClient.GetTicker(s.instrumentID)
+    if err != nil {
+        log.Printf("❌ GetTicker error: %v", err)
+        return fmt.Errorf("ticker: %w", err)
+    }
+    price := ticker.Last
+
+    // 2. Вычисление динамического ATR-множителя
+    var atrMult float64
+    var slDistance, slPrice, tpPrice float64
+    var size float64
+
+    if s.config.DynamicATRMult {
+        // Динамический ATR-множитель на основе диапазона свечи
+        range30m := candle.High - candle.Low
+        atrMult = 0.5 + (range30m/price)*100 // 0.5-3.0
+        if atrMult < s.config.MinATRMult {
+            atrMult = s.config.MinATRMult
+        }
+        if atrMult > s.config.MaxATRMult {
+            atrMult = s.config.MaxATRMult
+        }
+        
+        // Динамический SL/TP
+        slDistance = atr * atrMult // динамический стоп
+        if side == types.OrderSideBuy {
+            slPrice = price - slDistance
+        } else {
+            slPrice = price + slDistance // для шорта
+        }
+        
+        // TP = SL * 1.5
+        if side == types.OrderSideBuy {
+            tpPrice = price + slDistance*1.5
+        } else {
+            tpPrice = price - slDistance*1.5 // для шорта
+        }
+        
+        // Размер позиции на основе риска и расстояния до SL
+        bal, err := s.restClient.GetBalance("USDT")
+        if err != nil {
+            return fmt.Errorf("balance: %w", err)
+        }
+        
+        // Ограничиваем размер позиции по доступному балансу при 1x плече (кросс-маржа)
+        maxContractSize := (bal.Availablebal * 0.9) / price // 90% баланса для надежности
+        
+        // Используем фиксированный риск от начального баланса, если он задан, иначе - от текущего баланса
+        var riskUSD float64
+        if s.initialBalance > 0 {
+            // Используем фиксированный риск от начального баланса
+            riskUSD = s.initialBalance * (s.config.RiskPercent / 100.0)
+        } else {
+            // Используем риск от текущего баланса (старое поведение)
+            riskUSD = bal.Availablebal * (s.config.RiskPercent / 100.0)
+        }
+        size = riskUSD / slDistance
+        
+        // Ограничиваем по максимальному доступному размеру
+        if size > maxContractSize {
+            size = maxContractSize
+        }
+        
+        if size < 0.1 {
+            return fmt.Errorf("not enough USDT for 1× cross nominal (need %.2f, have %.2f)",
+                size*price, bal.Availablebal)
+        }
+        
+        // === Округление до шага 0.1 (OKX lot-size) ===
+        size = math.Round(size*10) / 10
+        if size < 0.1 {
+            size = 0.1
+        }
+        if size > 1000 { // максимум 1000 контрактов
+            size = 1000
+        }
+    } else {
+        // Традиционный расчет
+        if s.config.PineMode {
+            // Проверяем, что ATRMultiplierSL не равен 0, чтобы избежать ошибки "invalid ATR distance: 0.000000"
+            atrMultiplier := s.config.ATRMultiplierSL
+            if atrMultiplier <= 0 {
+                log.Printf("⚠️ ATRMultiplierSL is %.2f, using fallback 0.5", atrMultiplier)
+                atrMultiplier = 0.5 // используем разумный fallback
+            }
+            
+            size, err = PinePositionSize(s.restClient, s.instrumentID,
+                s.config.EquityPercent, atr, atrMultiplier)
+            if err != nil {
+                log.Printf("⚠️ PinePositionSize error: %v, using fallback 0.1 size", err)
+                size = 0.1  // минимальный размер контракта
+                
+                // Также проверим, что ATR не равен 0, иначе используем разумный fallback
+                if atr <= 0 {
+                    log.Printf("⚠️ ATR is zero, using fallback 0.2 for calculations")
+                    atr = 0.2
+                }
+            } else {
+                // 2. Ограничиваем размер контракта доступным балансом в cross-режиме 1×
+                bal, err := s.restClient.GetBalance("USDT")
+                if err != nil {
+                    return fmt.Errorf("balance: %w", err)
+                }
+                
+                // Если используется фиксированный начальный баланс, ограничиваем по соотношению к начальному балансу
+                var effectiveBalance float64
+                if s.initialBalance > 0 {
+                    effectiveBalance = s.initialBalance
+                } else {
+                    effectiveBalance = bal.Availablebal
+                }
+                
+                maxContr := math.Floor(effectiveBalance / price / 0.1) * 0.1 // 0.1 шаг
+                if size > maxContr {
+                    size = maxContr
+                }
+                if size < 0.1 {
+                    return fmt.Errorf("not enough USDT for 1× cross nominal (need %.2f, have %.2f)",
+                        size*price, bal.Availablebal)
+                }
+            }
+            
+            // === Округление до шага 0.1 (OKX lot-size) ===
+            size = math.Round(size*10) / 10
+            if size < 0.1 {
+                size = 0.1
+            }
+            if size > 1000 { // максимум 1000 контрактов
+                size = 1000
+            }
+        } else {
+            // 2. Доступный USDT (Unified / Cross)
+            bal, err := s.restClient.GetBalance("USDT")
+            if err != nil {
+                return fmt.Errorf("balance: %w", err)
+            }
+            avail := bal.Availablebal
+            
+            // Используем фиксированный риск от начального баланса, если он задан, иначе - от текущего баланса
+            var riskAmt float64
+            if s.initialBalance > 0 {
+                // Используем фиксированный риск от начального баланса
+                riskAmt = s.initialBalance * (s.config.RiskPercent / 100.0)
+            } else {
+                // Используем риск от текущего баланса (старое поведение)
+                riskAmt = avail * (s.config.RiskPercent / 100.0) 
+            }
+            
+            if riskAmt <= 1.0 {
+                return fmt.Errorf("risk amount too small: %.2f", riskAmt)
+            }
+
+            // 3. Размер контракта
+            contractVal := 0.1 // минимальный шаг OKX для SWAP
+            size = math.Floor((riskAmt/price)/contractVal) * contractVal
+            if size < contractVal {
+                size = contractVal
+            }
+        }
+
+        // 4. Цены SL / TP с правильным соотношением риск/вознаграждение
+        if s.config.DynamicATRMult {
+            // Динамический расчет через ATR
+            slDistance := atr * atrMult
+            if side == types.OrderSideBuy {
+                slPrice = price - slDistance
+                // TP = риск * 1.5 (соотношение 1:1.5)
+                tpPrice = price + (slDistance * 1.5)
+            } else {
+                slPrice = price + slDistance
+                tpPrice = price - (slDistance * 1.5)
+            }
+        } else if s.config.PineMode {
+            // Pine Mode: Using exact parameters from Pine script (same ATR multiplier for SL and TP)
+            atr := s.currentATR()
+            if atr <= 0 {
+                atr = 0.20 // fallback value if ATR calculation fails
+            }
+            // In Pine script: sl = atr * atrMultiplier and tp = atr * atrMultiplier (same value)
+            slDistance := atr * s.config.ATRMultiplierSL   // 1.5×ATR (same as TP in Pine)
+            tpDistance := atr * s.config.ATRMultiplierTP   // 1.5×ATR (same as SL in Pine)
+
+            if side == types.OrderSideBuy {
+                slPrice = price - slDistance
+                tpPrice = price + tpDistance
+            } else {
+                slPrice = price + slDistance  // For short, SL is above entry
+                tpPrice = price - tpDistance  // For short, TP is below entry
+            }
+            // round to 0.01
+            slPrice = math.Round(slPrice*100) / 100
+            tpPrice = math.Round(tpPrice*100) / 100
+        } else {
+            // Классический режим: процент от цены с правильным соотношением
+            riskPercent := 0.015 // 1.5% риск
+            rewardPercent := 0.023 // 2.3% вознаграждение (соотношение 1:1.5)
+            
+            if side == types.OrderSideBuy {
+                slPrice = price * (1 - riskPercent)
+                tpPrice = price * (1 + rewardPercent)
+            } else {
+                slPrice = price * (1 + riskPercent)
+                tpPrice = price * (1 - rewardPercent)
+            }
+        }
+
+    // Округляем до шага цены (0.01 для SOL-USDT)
+    slPrice = math.Round(slPrice*100) / 100
+    tpPrice = math.Round(tpPrice*100) / 100
+
+    // Проверяем минимальное расстояние для SL (не менее 0.3% от цены входа)
+    minSLDistance := price * 0.003 // 0.3%
+    if math.Abs(price-slPrice) < minSLDistance {
+        if side == types.OrderSideBuy {
+            slPrice = price - minSLDistance
+        } else {
+            slPrice = price + minSLDistance
+        }
+        slPrice = math.Round(slPrice*100) / 100
+    }
+    
+    // Финальная защита от нулевых и некорректных значений SL/TP
+    if slPrice <= 0 {
+        if side == types.OrderSideBuy {
+            slPrice = price * 0.995  // 0.5% ниже для лонга
+        } else {
+            slPrice = price * 1.005  // 0.5% выше для шорта
+        }
+        slPrice = math.Round(slPrice*100) / 100
+        log.Printf("⚠️ Final fallback SL price: %.5f (entry: %.5f)", slPrice, price)
+    }
+    
+    if tpPrice <= 0 {
+        if side == types.OrderSideBuy {
+            tpPrice = price * 1.008  // 0.8% выше для лонга
+        } else {
+            tpPrice = price * 0.992  // 0.8% ниже для шорта
+        }
+        tpPrice = math.Round(tpPrice*100) / 100
+        log.Printf("⚠️ Final fallback TP price: %.5f (entry: %.5f)", tpPrice, price)
+    }
+    
+    // Добавляем лог для отладки - проверяем значения перед вычислением соотношения
+    log.Printf("DEBUG Before final logging: slPrice=%.5f, tpPrice=%.5f, price=%.5f", slPrice, tpPrice, price)
+    }
+
+    // Выводим информацию о динамическом расчете
+    if s.config.DynamicATRMult {
+        log.Printf("📊 Dynamic ATR sizing: atr=%.4f, atrMult=%.3f, range30m=%.4f, slDistance=%.4f, size=%.3f", 
+            atr, atrMult, candle.High-candle.Low, slDistance, size)
+    }
+
+    // Добавляем дополнительный отладочный лог перед вычислением risk/reward
+    log.Printf("DEBUG Right before risk/reward calculation: slPrice=%.5f, tpPrice=%.5f, price=%.5f", slPrice, tpPrice, price)
+    
+    // Добавляем логирование соотношения риск/вознаграждение
+    risk := math.Abs(price - slPrice)
+    reward := math.Abs(tpPrice - price)
+    ratio := reward / risk
+
+    log.Printf("📊 SL/TP calculated: Entry=%.2f, SL=%.2f (%.2f%%), TP=%.2f (%.2f%%), Ratio=1:%.1f",
+        price, slPrice, (risk/price)*100, tpPrice, (reward/price)*100, ratio)
+
+    // 5. Сторона закрытия
+    var closeSide types.OrderSide
+    var closePos string
+    if side == types.OrderSideBuy {
+        closeSide = types.OrderSideSell  // для закрытия лонга продаем
+        closePos = "long"
+    } else { // types.OrderSideSell
+        closeSide = types.OrderSideBuy   // для закрытия шорта покупаем
+        closePos = "short"
+    }
+
+    // 6. Debug logging for SL and TP
+    log.Printf("DEBUG attach SL and TP: entry=%.5f  slPrice=%.5f  tpPrice=%.5f  side=%s  closePos=%s", 
+        price, slPrice, tpPrice, side, closePos)
+    log.Printf("DEBUG used block: DynamicATRMult=%v  PineMode=%v  atr=%.5f", 
+        s.config.DynamicATRMult, s.config.PineMode, atr)
+    
+    // Проверяем, что SL и TP цены не равны нулю (иначе OKX отклонит ордер)
+    if slPrice <= 0 {
+        log.Printf("⚠️ Invalid SL price: %.5f (entry: %.5f, ATR: %.5f) — skipping order", slPrice, price, atr)
+        return fmt.Errorf("invalid SL price: %.5f", slPrice)
+    }
+    if tpPrice <= 0 {
+        log.Printf("⚠️ Invalid TP price: %.5f (entry: %.5f, ATR: %.5f) — skipping order", tpPrice, price, atr)
+        return fmt.Errorf("invalid TP price: %.5f", tpPrice)
+    }
+    
+    // 6. Формируем attach-algo (SL и TP)
+    attach := []types.AttachAlgoOrd{
+        {
+            OrdType:     "conditional",
+            Side:        closeSide,
+            PosSide:     closePos,
+            SlTriggerPx: slPrice,
+            SlOrdPx:     "-1",
+        },
+        {
+            OrdType:     "conditional",
+            Side:        closeSide,
+            PosSide:     closePos,
+            TpTriggerPx: tpPrice,
+            TpOrdPx:     "-1",
+        },
+    }
+
+    // 7. Основной ордер
+    order := &types.OrderRequest{
+        InstID:         s.instrumentID,
+        TdMode:         "cross",      // !!! теперь cross
+        Side:           side,
+        PosSide:        closePos,     // для хедж-режима
+        OrderType:      "market",
+        Size:           size,
+        ClOrdID:        fmt.Sprintf("strat%d%04d", time.Now().Unix(), rand.Intn(10000)),
+        AttachAlgoOrds: attach,
+    }
+
+    resp, err := s.restClient.PlaceOrder(order)
+    if err != nil {
+        return fmt.Errorf("place order: %w", err)
+    }
+    if resp.Code != "0" {
+        return fmt.Errorf("order failed: %s", resp.Message)
+    }
+
+    // 8. Ждём филла (коротко)
+    orderID := resp.Data[0].OrderID
+    var oi *types.OrderInfo
+    for i := 0; i < 20; i++ {
+        time.Sleep(500 * time.Millisecond)
+        oi, _ = s.restClient.GetOrderInfo(orderID, s.instrumentID)
+        if oi != nil && oi.Status == types.OrderStatusFilled {
+            break
+        }
+    }
+    if oi == nil || oi.Status != types.OrderStatusFilled {
+        return fmt.Errorf("order not filled")
+    }
+
+    // 9. Создаем позицию в памяти
+    pos := &types.Position{
+        ID:         fmt.Sprintf("%d", time.Now().UnixNano()),
+        Side:       side,
+        EntryPrice: oi.GetPrice(),
+        Size:       oi.Size,
+        StopLoss:   slPrice,
+        TakeProfit: tpPrice,
+        Status:     types.PositionStatusOpen,
+        OpenTime:   time.Now(),
+        OrderID:    orderID,
+        PeakPrice:  oi.GetPrice(), // Инициализируем PeakPrice как EntryPrice
+        EntryATR:   atr,          // ATR на момент входа
+        TrailOffset: atr * s.config.TrailATRMult,  // смещение для трейлинга
+    }
+    
+    // Extract algo order IDs from the response
+    if len(resp.Data) > 0 && len(resp.Data[0].AttachAlgoOrds) > 0 {
+        for _, algoOrd := range resp.Data[0].AttachAlgoOrds {
+            // Check if this is a stop loss order (has slTriggerPx)
+            if algoOrd.SlTriggerPx != nil {
+                pos.StopLossAlgoID = algoOrd.AlgoID
+                log.Printf("✅ Captured SL algo order ID: %s", pos.StopLossAlgoID)
+                break
+            }
+        }
+    }
+    
+    // Use the centralized trailing stop manager instead of creating directly
+    if s.config.UseTrailingStop && s.config.TrailingPercent > 0 {
+        log.Printf("DEBUG: Trailing stop config - UseTrailingStop=%v, TrailingPercent=%.3f", 
+            s.config.UseTrailingStop, s.config.TrailingPercent)
+        log.Printf("DEBUG: About to initialize trailing stop via manager - size=%.3f entry=%.5f", oi.Size, oi.GetPrice())
+        
+        // Initialize trailing stop through the manager
+        if s.trailingManager != nil {
+            // Using type assertion to call the manager method
+            if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
+                if err := mgr.InitializeTrailingForPosition(pos, oi.GetPrice()); err != nil {
+                    log.Printf("⚠️ Failed to initialize trailing stop via manager: %v", err)
+                    // Fallback: if manager fails, we can still use fixed SL
+                    pos.StopLoss = slPrice
+                } else {
+                    log.Printf("✅ Trailing stop managed by centralized manager for position %s", pos.ID)
+                }
+            } else {
+                log.Printf("⚠️ Trailing manager type assertion failed, using fallback SL: %.4f", slPrice)
+                pos.StopLoss = slPrice
+            }
+        } else {
+            log.Printf("⚠️ Trailing manager not available, using fallback SL: %.4f", slPrice)
+            pos.StopLoss = slPrice
+        }
+    } else {
+        log.Printf("ℹ️ Native trailing not set - condition not met: UseTrailingStop=%v, TrailingPercent=%.3f", 
+            s.config.UseTrailingStop, s.config.TrailingPercent)
+    }
+
+    s.positionsMu.Lock()
+    s.activePositions[pos.ID] = pos
+    s.positionsMu.Unlock()
+
+    // Increment daily trade counter
+    if s.trailingManager != nil {
+        if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
+            _ = mgr // Use the variable to avoid "declared and not used" error
+            // Call the increment function through the manager 
+            // This would require adding an increment function to the manager
+        }
+    }
+
+    log.Printf("✅ Entry %s %.3f @ %.2f  SL=%.2f  TP=%.2f",
+        side, oi.Size, oi.GetPrice(), slPrice, tpPrice)
+    return nil
+}
+
 // TradingStrategy interface defines trading strategy operations
+
+// atrStop возвращает цену стоп-лосса/тейк-профита на основе ATR
+func (s *AdvancedTradingStrategy) atrStop(entryPx float64, side types.OrderSide, atr float64, multiplier float64) float64 {
+	// Защита от нулевых или отрицательных значений
+	log.Printf("DEBUG atrStop - entryPx: %.5f, atr: %.5f, multiplier: %.2f", entryPx, atr, multiplier)
+	
+	if atr <= 0 || multiplier <= 0 {
+		log.Printf("⚠️ ATR(%.5f) or multiplier(%.2f) is zero, using fallback", atr, multiplier)
+		// Используем разумные fallback-значения
+		if atr <= 0 {
+			atr = entryPx * 0.005  // 0.5% от цены как fallback для ATR
+		}
+		if multiplier <= 0 {
+			multiplier = 0.5  // 0.5 как fallback для множителя
+		}
+	}
+	
+	distance := atr * multiplier
+	log.Printf("DEBUG atrStop - distance: %.5f (atr: %.5f * multiplier: %.2f)", distance, atr, multiplier)
+	
+	var stopPx float64
+	switch side {
+	case types.OrderSideBuy:
+		stopPx = entryPx - distance
+	case types.OrderSideSell:
+		stopPx = entryPx + distance
+	}
+	
+	log.Printf("DEBUG atrStop - before rounding: stopPx = %.5f (entryPx: %.5f, distance: %.5f)", stopPx, entryPx, distance)
+	
+	// округляем до шага тика 0.01 (для большинства USDT-пар)
+	stopPx = math.Round(stopPx*100) / 100
+	
+	log.Printf("DEBUG atrStop - after rounding: stopPx = %.5f", stopPx)
+	
+	// Проверяем, чтобы цена не была отрицательной или нулевой
+	if stopPx <= 0 {
+		log.Printf("⚠️ atrStop result is zero or negative: %.5f, using fallback", stopPx)
+		if side == types.OrderSideBuy {
+			// Для лонга SL не должен быть слишком низким
+			stopPx = entryPx * 0.98 // 2% от цены входа как минимальный SL
+		} else {
+			// Для шорта SL не должен быть слишком высоким
+			stopPx = entryPx * 1.02 // 2% от цены входа как минимальный SL
+		}
+		stopPx = math.Round(stopPx*100) / 100
+		log.Printf("DEBUG atrStop - after fallback: stopPx = %.5f", stopPx)
+	}
+	
+	return stopPx
+}
 type TradingStrategy interface {
 	Initialize(ctx context.Context) error
 	Update(candle *types.Candle)
@@ -23,6 +499,8 @@ type TradingStrategy interface {
 	GenerateSignal(side types.OrderSide, candle *types.Candle, atr, vwap float64, strategyName string) error
 	// All-In точка входа
 	EnterAllIn(side types.OrderSide) error
+	// Set trailing manager for the strategy
+	SetTrailingManager(interface{})
 }
 
 // AdvancedTradingStrategy implements RSI + VWAP rejection strategy
@@ -31,10 +509,18 @@ type AdvancedTradingStrategy struct {
 	restClient        *client.OKXRestClient
 	config            *config.StrategyConfig
 	instrumentID      string
+	timeframe         string
 
 	// Circular buffers for historical data
 	candleBuffer *CircularBuffer[*types.Candle]
 	priceBuffer  *CircularBuffer[float64]
+
+	// 15-minute candle buffer for RSI calculation
+	candleBuffer15m *CircularBuffer[*types.Candle]
+
+	// 30-minute candle buffer for indicators other than RSI
+	candleBuffer30m *CircularBuffer[*types.Candle]
+	last30mCandle   *types.Candle
 
 	// Position management
 	activePositions map[string]*types.Position
@@ -62,14 +548,29 @@ type AdvancedTradingStrategy struct {
 	processingMu       sync.Mutex
 	useTrailing        bool
 	trailingPercent    float64
+	lastSyncTime       time.Time
 
 	// RSI state tracking
-	prevRSI        float64  // значение RSI на предыдущей свече
-	prevCrossOver  bool     // уже было пересечение вверх (чтоб не дублировать)
-	prevCrossUnder bool     // уже было пересечение вниз (чтоб не дублировать)
+	prevRSI        float64 // значение RSI на предыдущей свече
+	prevCrossOver  bool    // уже было пересечение вверх (чтоб не дублировать)
+	prevCrossUnder bool    // уже было пересечение вниз (чтоб не дублировать)
+
+	// 15-minute RSI tracking
+	rsi15m         []float64 // 15-minute RSI values
+	rsi15mMu       sync.RWMutex
 
 	// Event handlers
 	onTradeSignal func(*types.TradeSignal) error
+
+	// Reference to the trailing manager
+	trailingManager interface{} // TrailingStopManager interface
+
+	// Fixed risk management
+	initialBalance float64 // начальный баланс для фиксированного риска
+
+	// For stopping goroutines
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewAdvancedTradingStrategy creates a new advanced trading strategy
@@ -78,17 +579,24 @@ func NewAdvancedTradingStrategy(
 	restClient *client.OKXRestClient,
 	cfg *config.StrategyConfig,
 	instrumentID string,
+	timeframe string,
 	bufferSize int,
 ) *AdvancedTradingStrategy {
+	ctx, cancel := context.WithCancel(context.Background())
+	
 	return &AdvancedTradingStrategy{
 		marketDataService: marketDataService,
 		restClient:        restClient,
 		config:            cfg,
 		instrumentID:      instrumentID,
+		timeframe:         timeframe,
 		candleBuffer:      NewCircularBuffer[*types.Candle](bufferSize),
 		priceBuffer:       NewCircularBuffer[float64](bufferSize),
+		candleBuffer15m:    NewCircularBuffer[*types.Candle](bufferSize), // 15-minute buffer
+		candleBuffer30m:    NewCircularBuffer[*types.Candle](bufferSize), // 30-minute buffer
 		activePositions:   make(map[string]*types.Position),
 		closedPositions:   make([]*types.Position, 0),
+		rsi15m:            make([]float64, 0),
 
 		// Strategy parameters
 		rsiLength:           cfg.RSILength,
@@ -105,6 +613,8 @@ func NewAdvancedTradingStrategy(
 		cooldownBars:        getOrDefaultInt(cfg.CooldownBars, 2), // Используем точное значение из оригинального скрипта
 		useTrailing:         cfg.UseTrailingStop,
 		trailingPercent:     cfg.TrailingPercent,
+		ctx:                 ctx,
+		cancel:              cancel,
 	}
 }
 
@@ -117,10 +627,43 @@ func getOrDefault(value, defaultValue float64) float64 {
 }
 
 func getOrDefaultInt(value, defaultValue int) int {
-	if value == 0 {
+	// Используем defaultValue только если value < 0 (как индикатор "не задано")
+	if value < 0 {
 		return defaultValue
 	}
 	return value
+}
+
+// syncPositionsFromExchange synchronizes internal positions with exchange positions
+func (s *AdvancedTradingStrategy) syncPositionsFromExchange() error {
+	positions, _ := s.restClient.GetPositions("SWAP")
+	
+	s.positionsMu.Lock()
+	defer s.positionsMu.Unlock()
+
+	// Если на бирже нет позиций - чистим всё
+	hasActive := false
+	for _, pos := range positions {
+		if pos.InstID == s.instrumentID && pos.Size > 0 {
+			hasActive = true
+			break
+		}
+	}
+
+	if !hasActive && len(s.activePositions) > 0 {
+		// Отменяем все трейлинги
+		for _, pos := range s.activePositions {
+			if pos.StopLossAlgoID != "" {
+				if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
+					_ = mgr.CancelExecutedTrailing(pos)
+				}
+			}
+		}
+		s.activePositions = make(map[string]*types.Position)
+		log.Printf("🔄 All positions cleared - exchange shows no active positions")
+	}
+
+	return nil
 }
 
 // SetOnTradeSignal sets the callback for trade signals
@@ -139,7 +682,7 @@ func (s *AdvancedTradingStrategy) Initialize(ctx context.Context) error {
 
 	for i, candle := range historicalData {
 		// ⚠️  ПРОПУСКАЕМ последнюю свечу, если она ещё не закрыта
-		if i == len(historicalData)-1 && !candle.IsCompleted() {
+		if i == len(historicalData)-1 && !s.isCandleCompleted(candle) {
 			log.Printf("⚠️  Skip incomplete warm-up candle: %v", candle.Timestamp)
 			continue
 		}
@@ -147,7 +690,60 @@ func (s *AdvancedTradingStrategy) Initialize(ctx context.Context) error {
 	}
 
 	log.Printf("📊 Loaded %d historical candles", s.candleBuffer.Size())
-	
+
+	// Load 15-minute historical data for RSI calculation
+	log.Println("🔍 Loading 15-minute historical data for RSI...")
+	historicalData15m, err := s.marketDataService.GetHistoricalDataForTimeframe(50, "15m")
+	if err != nil {
+		log.Printf("⚠️ Could not load 15m historical data: %v", err)
+	} else {
+		for i, candle := range historicalData15m {
+			// Skip incomplete candles
+			if i == len(historicalData15m)-1 && !s.isCandleCompleted(candle) {
+				log.Printf("⚠️  Skip incomplete 15m warm-up candle: %v", candle.Timestamp)
+				continue
+			}
+			s.candleBuffer15m.PushBack(candle)
+		}
+		
+		// Calculate initial RSI values
+		s.updateRSI15m()
+		log.Printf("📊 Loaded %d historical 15m candles", s.candleBuffer15m.Size())
+	}
+
+	// Load 30-minute historical data for indicators (VWAP, ATR, etc.)
+	log.Println("📊 Loading 30-minute historical data for indicators...")
+	historicalData30m, err := s.marketDataService.GetHistoricalDataForTimeframe(50, "30m")
+	if err != nil {
+		log.Printf("⚠️ Could not load 30m historical data: %v", err)
+	} else {
+		for i, candle := range historicalData30m {
+			// Skip incomplete candles
+			if i == len(historicalData30m)-1 && !s.isCandleCompleted(candle) {
+				log.Printf("⚠️ Skip incomplete 30m warm-up candle: %v", candle.Timestamp)
+				continue
+			}
+			s.candleBuffer30m.PushBack(candle)
+			s.last30mCandle = candle // Keep track of the last completed 30m candle
+		}
+		log.Printf("📊 Loaded %d historical 30m candles", s.candleBuffer30m.Size())
+	}
+
+	// Start polling 15-minute candles in a separate goroutine
+	go s.poll15mCandles()
+
+	// Register 30-minute candle handler with market data service (WebSocket-based)
+	if wsService, ok := s.marketDataService.(*marketdata.OKXMarketDataService); ok {
+		wsService.SetOnCandleUpdateForTimeframe(func(candle *types.Candle, timeframe string) {
+			if timeframe == "30m" {
+				s.On30mCandle(candle)
+			}
+		})
+	} else {
+		// Fallback to REST polling if the service is not WebSocket-based
+		go s.poll30mCandlesREST()
+	}
+
 	// Check for any existing positions on the exchange
 	log.Println("🔍 Checking for existing positions on exchange...")
 	positions, err := s.restClient.GetPositions("SWAP")
@@ -168,16 +764,16 @@ func (s *AdvancedTradingStrategy) Initialize(ctx context.Context) error {
 					Status:     types.PositionStatusOpen,
 					OpenTime:   time.Now(),
 				}
-				
+
 				s.positionsMu.Lock()
 				s.activePositions[internalPos.ID] = internalPos
 				s.positionsMu.Unlock()
-				
+
 				log.Printf("📌 Added exchange position to internal state")
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -195,33 +791,25 @@ func (s *AdvancedTradingStrategy) Update(candle *types.Candle) {
 		s.prevRSI = 0 // Reset RSI state
 		return
 	}
-	
+
 	s.currentPrice = candle.Close
-	
+
 	// Still add to buffer for indicator calculations
 	s.candleBuffer.PushBack(candle)
 
-	// Calculate indicators using all candles (including current)
-	candles := s.candleBuffer.ToSlice()
-	vwap := s.calculateDailyVWAP(candles) // Calculate VWAP for all candles
-	closes := make([]float64, len(candles))
-	highs := make([]float64, len(candles))
-	lows := make([]float64, len(candles))
-
-	for i, c := range candles {
-		closes[i] = c.Close
-		highs[i] = c.High
-		lows[i] = c.Low
-	}
-
-	atr := 0.0
-	if len(closes) >= s.atrLength {
-		atr = s.calculateATR(highs, lows, closes, s.atrLength)
-	}
-
+	// Calculate RSI using 15-minute candles (for signal generation)
+	closes15 := []float64{}
 	rsi := []float64{}
-	if len(closes) >= s.rsiLength {
-		rsi = s.calculateRSI(closes, s.rsiLength)
+	
+	// Get 15-minute closes for RSI calculation
+	candleBuffer15S := s.candleBuffer15m.ToSlice()
+	closes15 = make([]float64, len(candleBuffer15S))
+	for i, c := range candleBuffer15S {
+		closes15[i] = c.Close
+	}
+
+	if len(closes15) >= s.rsiLength {
+		rsi = s.calculateRSI(closes15, s.rsiLength)
 	}
 
 	currentRSI := 0.0
@@ -229,13 +817,44 @@ func (s *AdvancedTradingStrategy) Update(candle *types.Candle) {
 		currentRSI = rsi[len(rsi)-1]
 	}
 
+	// Check if we have 30-minute data ready for indicators
+	if s.last30mCandle == nil {
+		log.Printf("⏳ 30m data not ready yet – skip indicators")
+		// Update position management even if not enough data for signals
+		s.checkStopConditions(candle.Close)
+		s.updateTrailingStops(candle.Close)
+		s.checkPositionTimeouts()
+		// Update RSI state for next iteration
+		s.prevRSI = currentRSI
+		return
+	}
+
+	// Calculate indicators using 30-minute candles (for VWAP, ATR, volume, etc.)
+	candles30 := s.candleBuffer30m.ToSlice()
+	vwap := s.calculateDailyVWAP(candles30) // Calculate VWAP for 30-minute candles
+	var atr float64
+	if len(candles30) >= s.atrLength {
+		highs30, lows30, closes30 := extractHLCCandles(candles30)
+		atr = s.calculateATR(highs30, lows30, closes30, s.atrLength)
+	} else {
+		atr = 0.10 // fallback до 14-го бара
+		log.Printf("⚠ ATR fallback used: %.2f (data=%d)", atr, len(candles30))
+	}
+	if atr <= 0 || atr < 0.10 { // минимум 10 центов
+		atr = 0.10
+		log.Printf("⚠ ATR fallback used: %.2f (data=%d)", atr, len(candles30))
+	}
+
+	// Get volume from the last 30-minute candle
+	volume30 := s.last30mCandle.Volume
+
 	log.Printf("[STRATEGY] %s | O=%.2f H:%.2f L:%.2f C=%.2f V=%.2f | RSI=%.2f VWAP=%.2f ATR=%.4f",
 		candle.Timestamp.Format("15:04:05"),
 		candle.Open, candle.High, candle.Low, candle.Close, candle.QuoteVolume,
 		currentRSI, vwap, atr)
 
-	// Need at least 2 candles for comparison and 2 RSI values for crossover detection
-	if s.candleBuffer.Size() < 2 || len(rsi) < 2 {
+	// Need at least 2 15-minute candles for RSI comparison and 2 RSI values for crossover detection
+	if len(closes15) < 2 || len(rsi) < 2 {
 		// Update position management even if not enough data for signals
 		s.checkStopConditions(candle.Close)
 		s.updateTrailingStops(candle.Close)
@@ -265,9 +884,15 @@ func (s *AdvancedTradingStrategy) Update(candle *types.Candle) {
 	s.checkStopConditions(candle.Close)
 	s.updateTrailingStops(candle.Close)
 	s.checkPositionTimeouts()
-	
+
 	// Check liquidation risk to prevent forced liquidation
 	s.checkLiquidationRisk(candle.Close)
+	
+	// Periodically synchronize positions with exchange to ensure consistency
+	if time.Since(s.lastSyncTime) > 30*time.Second {
+		s.syncPositionsFromExchange()
+		s.lastSyncTime = time.Now()
+	}
 
 	// Only generate signals from completed candles
 	// Use the previously completed candle for signal generation
@@ -276,28 +901,46 @@ func (s *AdvancedTradingStrategy) Update(candle *types.Candle) {
 		candleSlice := s.candleBuffer.ToSlice()
 		if len(candleSlice) >= 2 {
 			prevCandle := candleSlice[len(candleSlice)-2] // Previous completed candle
-			bearishRejection := prevCandle.Close > vwap // цена выше VWAP на предыдущей свече
-			bullishRejection := prevCandle.Close < vwap // цена ниже VWAP на предыдущей свече
+			bearishRejection := prevCandle.Close > vwap   // цена выше VWAP на предыдущей свече
+			bullishRejection := prevCandle.Close < vwap   // цена ниже VWAP на предыдущей свече
 
-			// Check if we can trade
+			// Check if we can trade (using 15-minute candle cooldown)
 			canTrade := s.canTrade(prevCandle)
 
 			// Add debug logging to show indicator values
-			log.Printf("[STRATEGY] RSI=%.2f, VWAP=%.2f, ATR=%.4f | Conditions - RSI_Cross: %t, RSI_Crossunder: %t, Bullish(rej.): %t, Bearish(rej.): %t, CanTrade: %t", 
+			log.Printf("[STRATEGY] RSI=%.2f, VWAP=%.2f, ATR=%.4f | Conditions - RSI_Cross: %t, RSI_Crossunder: %t, Bullish(rej.): %t, Bearish(rej.): %t, CanTrade: %t",
 				currentRSI, vwap, atr, crossOver, crossUnder, bullishRejection, bearishRejection, canTrade)
 
-			// Generate signals only based on completed candle
-			if canTrade && crossOver && bullishRejection {
-				log.Printf("✅ LONG SIGNAL: RSI(%.2f) crossed up(%.2f), Bullish Rejection, Volume: %.2f", currentRSI, s.rsiOversold, prevCandle.Volume)
+			// NEW: Check 15-minute RSI as a filter
+			rsi15mPassed := true
+			rsi15mValue := 0.0
+			if rsi15m, ok := s.getLatestRSI15m(); ok {
+				rsi15mValue = rsi15m
+				// For long signals, 15m RSI should be < 70 (not overbought)
+				// For short signals, 15m RSI should be > 30 (not oversold)
+				if crossOver && rsi15m >= 70 {
+					rsi15mPassed = false
+					log.Printf("🚫 LONG signal filtered out by 15m RSI (%.2f >= 70)", rsi15m)
+				} else if crossUnder && rsi15m <= 30 {
+					rsi15mPassed = false
+					log.Printf("🚫 SHORT signal filtered out by 15m RSI (%.2f <= 30)", rsi15m)
+				}
+			} else {
+				log.Printf("⚠️ 15m RSI not available, skipping filter")
+			}
+
+			// Generate signals only based on completed candle and 15m RSI filter
+			if canTrade && crossOver && bullishRejection && rsi15mPassed {
+				log.Printf("✅ LONG SIGNAL: RSI(%.2f) crossed up(%.2f), Bullish Rejection, Volume: %.2f, 15m RSI: %.2f", currentRSI, s.rsiOversold, volume30, rsi15mValue)
 				go s.GenerateSignal(types.OrderSideBuy, prevCandle, atr, vwap, "RSI+VWAP")
 				// Update last signal bar index
-				currentBarIndex := s.candleBuffer.Size() - 2   // ← -2  (previous COMPLETED bar)
+				currentBarIndex := s.candleBuffer.Size() - 2 // ← -2  (previous COMPLETED bar)
 				s.lastSignalBarIndex = &currentBarIndex
-			} else if canTrade && crossUnder && bearishRejection {
-				log.Printf("✅ SHORT SIGNAL: RSI(%.2f) crossed down(%.2f), Bearish Rejection, Volume: %.2f", currentRSI, s.rsiOverbought, prevCandle.Volume)
+			} else if canTrade && crossUnder && bearishRejection && rsi15mPassed {
+				log.Printf("✅ SHORT SIGNAL: RSI(%.2f) crossed down(%.2f), Bearish Rejection, Volume: %.2f, 15m RSI: %.2f", currentRSI, s.rsiOverbought, volume30, rsi15mValue)
 				go s.GenerateSignal(types.OrderSideSell, prevCandle, atr, vwap, "RSI+VWAP")
 				// Update last signal bar index
-				currentBarIndex := s.candleBuffer.Size() - 2   // ← -2  (previous COMPLETED bar)
+				currentBarIndex := s.candleBuffer.Size() - 2 // ← -2  (previous COMPLETED bar)
 				s.lastSignalBarIndex = &currentBarIndex
 			}
 		}
@@ -307,29 +950,100 @@ func (s *AdvancedTradingStrategy) Update(candle *types.Candle) {
 	s.prevRSI = currentRSI
 }
 
+// Stop stops the strategy and cancels any ongoing operations
+func (s *AdvancedTradingStrategy) Stop() {
+	log.Println("🛑 Stopping trading strategy...")
+	
+	// Cancel the context to stop any goroutines
+	if s.cancel != nil {
+		s.cancel()
+	}
+	
+	// Close any active positions
+	s.positionsMu.Lock()
+	defer s.positionsMu.Unlock()
+	
+	for _, pos := range s.activePositions {
+		// Cancel trailing stops if any
+		if pos.StopLossAlgoID != "" {
+			if _, err := s.restClient.CancelAlgoOrder(pos.StopLossAlgoID, s.instrumentID); err != nil {
+				log.Printf("⚠️ Failed to cancel trailing stop %s: %v", pos.StopLossAlgoID, err)
+			} else {
+				log.Printf("✅ Cancelled trailing stop %s", pos.StopLossAlgoID)
+			}
+		}
+		
+		// Close position at market
+		var side types.OrderSide
+		if pos.Side == types.OrderSideBuy {
+			side = types.OrderSideSell // To close long position
+		} else {
+			side = types.OrderSideBuy // To close short position
+		}
+		
+		closeOrder := &types.OrderRequest{
+			InstID:    s.instrumentID,
+			TdMode:    "cross",
+			Side:      side,
+			PosSide:   string(pos.Side), // Position side: long/short
+			OrderType: "market",
+			Size:      pos.Size,
+			ClOrdID:   fmt.Sprintf("stop_close_%d", time.Now().UnixNano()),
+		}
+		
+		if resp, err := s.restClient.PlaceOrder(closeOrder); err != nil || resp.Code != "0" {
+			log.Printf("❌ Failed to close position: %v", err)
+			if resp != nil {
+				log.Printf("❌ Response: %s", resp.Message)
+			}
+		} else {
+			log.Printf("✅ Closed position at market")
+		}
+	}
+	
+	s.activePositions = make(map[string]*types.Position)
+	log.Println("✅ Trading strategy stopped")
+}
+
 // canTrade checks if trading conditions are met
 func (s *AdvancedTradingStrategy) canTrade(candle *types.Candle) bool {
 	log.Printf("🔍 Checking if can trade...")
-	
-	// Check cooldown
+
+	// Check cooldown with debug info
 	if s.lastSignalBarIndex != nil && s.candleBuffer.Size()-*s.lastSignalBarIndex <= s.cooldownBars {
+		log.Printf("DEBUG cooldown: lastSignalBarIndex=%v, currentBarIndex=%d, diff=%d, cooldown=%d",
+			s.lastSignalBarIndex, s.candleBuffer.Size()-1,
+			s.candleBuffer.Size()-1 - *s.lastSignalBarIndex, s.cooldownBars)
 		log.Println("⏳ Cooldown period - cannot trade")
 		return false
+	}
+
+	if s.lastSignalBarIndex != nil {
+		log.Printf("DEBUG cooldown: lastSignalBarIndex=%v, currentBarIndex=%d, diff=%d, cooldown=%d",
+			s.lastSignalBarIndex, s.candleBuffer.Size()-1,
+			s.candleBuffer.Size()-1 - *s.lastSignalBarIndex, s.cooldownBars)
 	}
 
 	// Check if we already have an active position
 	hasPosition := s.hasActivePosition()
 	log.Printf("🎯 Can trade: %t (Has internal active position: %t)", !hasPosition, hasPosition)
-	
+
 	return !hasPosition
 }
 
-	// Check if position already exists for swap
+// Check if position already exists for swap
 
 // GenerateSignal generates a trading signal and executes the trade
 func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *types.Candle, atr, vwap float64, strategyName string) error {
 	log.Printf("🔄 Attempting to generate signal: %s", side)
-	
+
+	// Point of control - check conditions
+	balance, err := s.restClient.GetBalance("USDT")
+	balanceCheck := err == nil && balance.Availablebal > 0
+
+	log.Printf("🐞 GenerateSignal: side=%s, canTrade=%t, hasPos=%t, balanceCheck=%t, balance=%.2f",
+		side, s.canTrade(candle), s.hasActivePosition(), balanceCheck, balance.Availablebal)
+
 	s.processingMu.Lock()
 	if s.isProcessingSignal {
 		log.Println("⚠️ Signal processing is already in progress - skipping")
@@ -345,427 +1059,302 @@ func (s *AdvancedTradingStrategy) GenerateSignal(side types.OrderSide, candle *t
 		s.processingMu.Unlock()
 	}()
 
-	log.Println("🔍 Checking for existing positions...")
-	
-	// Set leverage before placing order to ensure proper margin mode
-	if !s.config.AllInMode {
-		leverage := 5 // Using 5x leverage which is appropriate for futures trading
-		log.Printf("📊 Setting leverage for %s to %d in isolated mode", s.instrumentID, leverage)
-		if side == types.OrderSideBuy {
-			_ = s.restClient.SetLeverage(s.instrumentID, "isolated", leverage, "long")
-		} else {
-			_ = s.restClient.SetLeverage(s.instrumentID, "isolated", leverage, "short")
-		}
-	} else {
-		// For AllInMode, set leverage to 1x in cross mode
-		log.Printf("📊 Setting leverage for %s to 1 in cross mode (AllInMode)", s.instrumentID)
-		_ = s.restClient.SetLeverage(s.instrumentID, "cross", 1, "")
-	}
-	
-	// Check if position already exists for swap
-	positions, err := s.restClient.GetPositions("SWAP") // Check only swap positions
+	// Добавляем лог перед вызовом enterWithSLTP
+	log.Printf("🔍 About to call enterWithSLTP: side=%s, atr=%.4f", side, atr)
+	err = s.enterWithSLTP(side, candle, atr)
 	if err != nil {
-		return fmt.Errorf("failed to get positions: %w", err)
+		log.Printf("❌ enterWithSLTP failed: %v", err)
+		return err
 	}
-
-	for _, pos := range positions {
-		if pos.InstID == s.instrumentID {
-			log.Println("⚠️ Position already open - skipping signal")
-			return nil
-		}
-	}
-
-	log.Println("💰 Calculating position size...")
-	
-	// Calculate position size - using 90% of balance with 0.5 USDT reserve for fees
-	balance, err := s.restClient.GetBalance("USDT")
-	if err != nil {
-		log.Printf("❌ Failed to get balance: %v", err)
-		return fmt.Errorf("failed to get balance: %w", err)
-	}
-
-	log.Printf("💵 Balance: Available=%.2f", balance.Availablebal)
-	
-	// Use RiskPercent of balance for position, keeping 0.5 USDT for fees
-	riskFraction := s.riskPercent / 100.0
-	maxSpend := balance.Availablebal*riskFraction - 0.5
-	if maxSpend <= 0 {
-		log.Printf("⚠️ Insufficient USDT balance for position after fees (%.2f)", balance.Availablebal)
-		return nil
-	}
-
-	log.Printf("📊 Risk %.1f%% → max spend: %.2f USDT", s.riskPercent, maxSpend)
-
-	// Place market or limit order based on configuration and liquidity
-	var order *types.OrderRequest
-	var size float64
-
-	ticker, err := s.restClient.GetTicker(s.instrumentID)
-	if err != nil {
-		log.Printf("❌ Failed to get ticker: %v", err)
-		return nil
-	}
-
-	// Check liquidity based on bid/ask spread and last price
-	// If liquidity is low (volume = 0), we should consider using market order to avoid "All operations failed" error
-	// The volume information is not directly in ticker, but we can use the presence of bid/ask prices as a proxy
-	
-	// For both long and short positions in perpetual swap, calculate size based on available balance
-	size = maxSpend / ticker.Last
-	log.Printf("📊 Pre-futures: maxSpend=%.2f, price=%.2f, size=%.4f", maxSpend, ticker.Last, size)
-
-	// Apply minimum lot size requirements for OKX futures
-	// For AllInMode use cross mode which has 0.1 minimum, otherwise 0.01
-	var minContract float64
-	if s.config.AllInMode {
-		minContract = 0.1  // Minimum for futures in cross mode
-	} else {
-		minContract = 0.01 // Minimum for futures in other modes
-	}
-	
-	// 1. максимально возможный размер
-	maxSize := (balance.Availablebal*(s.riskPercent/100.0) - 0.5) / ticker.Last
-	log.Printf("📊 maxSize before rounding: %.4f", maxSize)
-	
-	// 2. округляем вниз до 0.1 с запасом 0.1$
-	size = math.Floor((maxSize - 0.1)*10) / 10   // ← -0.1$ запас
-	log.Printf("📊 size after rounding: %.4f", size)
-	
-	if size < 0.1 {
-		size = 0.1
-		log.Printf("📊 size set to minimum 0.1")
-	}
-	
-	if size < minContract {
-		size = minContract
-		log.Printf("📊 size set to minContract: %.4f", minContract)
-	}
-	
-	// 3. финальная стоимость
-	realCost := size * ticker.Last
-	log.Printf("📊 realCost: %.4f (size: %.4f * price: %.4f)", realCost, size, ticker.Last)
-	
-	// Проверяем, хватит ли денег
-	needUSDT := size*ticker.Last + 0.5 // 0.5 на комиссию
-	if needUSDT > balance.Availablebal {
-		log.Printf("❌ Недостаточно USDT: нужно %.2f, есть %.2f – пропускаем сигнал", needUSDT, balance.Availablebal)
-		return nil                       // не входим
-	}
-	
-	// ОТКЛЮЧАЕМ авто-увеличение размера до минимального номинала OKX
-	// minContr := 1.0                       // шаг лота для QTUM
-	// minNotional := 20.0                   // порог OKX для QTUM
-	// notional := size * ticker.Last
-
-	// if notional < minNotional {
-	// 	size = math.Ceil(minNotional/ticker.Last/minContr) * minContr
-	// 	log.Printf("⚠️  Увеличили size до %.1f (номинал %.2f USDT) для соблюдения минимума OKX", size, size*ticker.Last)
-	// 	
-	// 	// Проверяем снова, хватит ли денег после увеличения размера
-	// 	needUSDT = size*ticker.Last + 0.5
-	// 	if needUSDT > balance.Availablebal {
-	// 		log.Printf("❌ После увеличения размера недостаточно USDT: нужно %.2f, есть %.2f – пропускаем сигнал", needUSDT, balance.Availablebal)
-	// 		return nil                       // не входим
-	// 	}
-	// }
-	
-	// Проверим, что размер соответствует минимальным требованиям по номиналу для рыночного ордера
-	// (перемещено после определения orderType)
-	
-	// Ensure that we have enough USDT in the appropriate account before placing order
-	if s.config.AllInMode {
-		// For all-in mode using cross, ensure we have funds available
-		// Since we're using cross mode now, check the cross margin balance
-		bal, err := s.restClient.GetMarginBalance("USDT")
-		if err != nil {
-			log.Printf("⚠️ Could not fetch cross margin balance: %v, falling back to unified account", err)
-			// Fallback to unified account check
-			bal, err := s.restClient.GetBalance("USDT")
-			if err != nil {
-				log.Printf("❌ balance check failed: %v", err)
-				return nil
-			}
-			if bal.Availablebal < realCost + 0.5 {
-				log.Printf("❌ Insufficient funds in unified account. Available: %.2f, Need: %.2f", bal.Availablebal, realCost + 0.5)
-				return nil
-			}
-		} else {
-			if bal.Availablebal < realCost + 0.5 {
-				log.Printf("❌ Insufficient funds in cross margin account. Available: %.2f, Need: %.2f", bal.Availablebal, realCost + 0.5)
-				return nil
-			}
-		}
-	} else {
-		// For non-all-in mode, use ensureCrossUSDT
-		if err := s.ensureCrossUSDT(realCost + 0.5); err != nil {
-			log.Printf("❌ funding transfer failed: %v", err)
-			return nil
-		}
-	}
-
-	log.Printf("📊 Post-futures: size=%.4f", size)
-
-	// Choose the appropriate trading mode based on AllInMode
-	tdMode := "isolated" // default
-	if s.config.AllInMode {
-		tdMode = "cross" // cross mode for all-in without leverage (cash не работает с фьючерсами)
-	}
-	
-	// Determine order type based on configuration and liquidity
-	orderType := s.config.OrderType
-	if orderType == "" {
-		orderType = "market" // default to market if not specified
-	}
-	
-	// Check for low liquidity by attempting to get order book
-	orderBook, err := s.restClient.GetOrderBook(s.instrumentID, 1) // Get top of book
-	lowLiquidity := err != nil || len(orderBook.Asks) == 0 || len(orderBook.Bids) == 0
-	
-	// If order book is empty or error occurred, it's low liquidity situation
-	if lowLiquidity {
-		log.Printf("⚠️ Low liquidity detected - using market order to avoid 'All operations failed' error")
-		orderType = "market" // Force market order when liquidity is low
-	}
-	
-	var price *float64 = nil
-	if orderType == "limit" {
-		// Get order book to determine best available prices
-		if err != nil || len(orderBook.Asks) == 0 || len(orderBook.Bids) == 0 {
-			log.Printf("⚠️ Could not get order book, using calculated price: %v", err)
-			// Fallback: calculate limit price depending on order side for immediate fill:
-			// - For buy orders: place slightly above market to get filled immediately
-			// - For sell orders: place slightly below market to get filled immediately
-			limitPrice := ticker.Last
-			if side == types.OrderSideBuy {
-				// For buy orders, place slightly above current market to be filled immediately
-				limitPrice = ticker.Last * 1.001 // 0.1% above market
-			} else {
-				// For sell orders, place slightly below current market to be filled immediately
-				limitPrice = ticker.Last * 0.999 // 0.1% below market
-			}
-			price = &limitPrice
-		} else {
-			// Use prices from the order book
-			if side == types.OrderSideBuy {
-				// For buy orders, use the best ask price (lowest sell price) 
-				askPriceStr := orderBook.Asks[0][0] // First element is price
-				askPrice, err := strconv.ParseFloat(askPriceStr, 64)
-				if err != nil {
-					log.Printf("⚠️ Could not parse ask price, using calculated price: %v", err)
-					limitPrice := ticker.Last * 1.001
-					price = &limitPrice
-				} else {
-					// Place slightly above the best ask to ensure execution
-					limitPrice := askPrice * 1.0005 // 0.05% above best ask
-					price = &limitPrice
-				}
-			} else {
-				// For sell orders, use the best bid price (highest buy price)
-				bidPriceStr := orderBook.Bids[0][0] // First element is price
-				bidPrice, err := strconv.ParseFloat(bidPriceStr, 64)
-				if err != nil {
-					log.Printf("⚠️ Could not parse bid price, using calculated price: %v", err)
-					limitPrice := ticker.Last * 0.999
-					price = &limitPrice
-				} else {
-					// Place slightly below the best bid to ensure execution
-					limitPrice := bidPrice * 0.9995 // 0.05% below best bid
-					price = &limitPrice
-				}
-			}
-		}
-		
-		// Проверяем минимальный номинал для лимитных ордеров
-		// OKX требует минимальный номинал ~20 USDT для лимитных ордеров на фьючерсах
-		minNotional := 20.0 // OKX лимит для фьючерсных инструментов
-		notional := size * *price // номинал = размер * цена
-		
-		if notional < minNotional {
-			log.Printf("⚠️  Лимитный номинал %.2f < %.2f USDT – переключаемся на рыночный", notional, minNotional)
-			orderType = "market" // переключаемся на рыночный ордер
-			price = nil // у рыночного ордера цена не указывается
-		} else {
-			log.Printf("📊 Limit price calculated: %.4f for %s order (nominal: %.2f USDT)", *price, side, notional)
-			
-			// Дополнительная проверка: если номинал < 25 USD – force market, чтобы избежать "All operations failed"
-			// OKX может отклонить лимитные ордера даже с номиналом > 1 USD из-за широкого спреда или малого объёма
-			if notional < 25.0 {
-				log.Printf("⚠️  Nominal %.2f < 25 USD – force market order to avoid 'All operations failed'", notional)
-				orderType = "market"
-				price = nil
-			}
-		}
-	}
-	
-	// Проверим, что размер соответствует минимальным требованиям по номиналу для рыночного ордера
-	minMarketNotional := 1.0 // минимальный номинал для рыночных ордеров OKX (обычно 1 USDT)
-	if orderType == "market" && realCost < minMarketNotional {
-		log.Printf("⚠️  Рыночный ордер номиналом %.2f < %.2f USDT – пропускаем", realCost, minMarketNotional)
-		return nil
-	}
-
-	// Если номинал < 55 USD – увеличиваем размер до 55 USD для рыночных ордеров
-	// (проверка после всех возможных переключений на market-ордер)
-	if orderType == "market" {
-		nominal := size * ticker.Last
-		if nominal < 55.0 {
-			minContract := 0.1 // используем минимальный размер контракта для фьючерсов
-			size = math.Ceil(55.0 / ticker.Last / minContract) * minContract
-			realCost = size * ticker.Last
-			log.Printf("⚠  Nominal < 55 USD – increased size to %.4f (nominal: %.2f USDT)", size, realCost)
-		}
-	}
-	
-	order = &types.OrderRequest{
-		InstID:    s.instrumentID,  // futures contract
-		TdMode:    tdMode,           // cross mode for all-in, isolated otherwise
-		Side:      side,
-		OrderType: orderType,
-		Size:      size,
-		Price:     price,
-	}
-
-	log.Printf("📊 Preparing to place order - Size: %.4f, Price: %v, Type: %s, Nominal: %.4f", 
-		size, price, orderType, size*ticker.Last)
-
-	orderResp, err := s.restClient.PlaceOrder(order)
-	if err != nil {
-		log.Printf("❌ Failed to place order: %v", err)
-		return fmt.Errorf("failed to place order: %w", err)
-	}
-
-	if orderResp.Code != "0" {
-		log.Printf("❌ Order failed with code %s: %s", orderResp.Code, orderResp.Message)
-		// Попробуем получить больше информации о причине ошибки
-		log.Printf("📊 Order details - InstID: %s, Side: %s, Size: %.4f, Price: %v, Type: %s", 
-			order.InstID, order.Side, order.Size, order.Price, order.OrderType)
-		return fmt.Errorf("order failed: %s", orderResp.Message)
-	}
-
-	if len(orderResp.Data) == 0 {
-		log.Println("❌ No order ID returned")
-		return fmt.Errorf("no order ID returned")
-	}
-
-	orderID := orderResp.Data[0].OrderID
-	log.Printf("✅ Order placed successfully. Order ID: %s", orderID)
-
-	// Wait for order to be filled
-	var orderInfo *types.OrderInfo
-	for i := 0; i < 20; i++ { // Increased timeout
-		time.Sleep(500 * time.Millisecond)
-		orderInfo, err = s.restClient.GetOrderInfo(orderID, s.instrumentID)
-		if err != nil {
-			log.Printf("⚠️ Error getting order info: %v", err)
-			continue
-		}
-		if orderInfo.Status == types.OrderStatusFilled {
-			log.Printf("✅ Order filled. Status: %s, Price: %.2f, Size: %.3f", orderInfo.Status, orderInfo.Price, orderInfo.Size)
-			break
-		}
-		log.Printf("⏳ Waiting for order fill... Current status: %s", orderInfo.Status)
-	}
-
-	if orderInfo == nil {
-		log.Printf("❌ Order info still nil after timeout – aborting")
-		return nil
-	}
-	
-	if orderInfo.Status != types.OrderStatusFilled {
-		log.Printf("⚠️ Order not filled within timeout. Last status: %v", orderInfo.Status)
-		return nil
-	}
-
-	filledPrice := orderInfo.Price
-	filledSize := orderInfo.Size
-
-	log.Printf("✅ Entry %s %.3f @ %.2f", side, filledSize, filledPrice)
-
-	// Set up exit strategy - using guaranteed conditional orders for safety
-	log.Println("🎯 Setting up guaranteed exit strategy...")
-	s.setupGuaranteedExit(side, filledPrice, filledSize)
-
-	// Store position
-	position := &types.Position{
-		ID:             fmt.Sprintf("%d", time.Now().UnixNano()),
-		Side:           side,
-		EntryPrice:     filledPrice,
-		Size:           filledSize,
-		StopLoss:       0, // Will be set by exit strategy
-		TakeProfit:     0, // Will be set by exit strategy
-		Status:         types.PositionStatusOpen,
-		OpenTime:       time.Now(),
-		OrderID:        orderID,
-		IsTrailingStop: s.useTrailing,
-	}
-
-	s.positionsMu.Lock()
-	s.activePositions[position.ID] = position
-	s.positionsMu.Unlock()
-	log.Printf("📌 Position stored. Active positions now: %d", len(s.activePositions))
-
-	// Update last signal bar index
-	currentBarIndex := s.candleBuffer.Size() - 1   // ← -1  (last COMPLETED bar)
-	s.lastSignalBarIndex = &currentBarIndex
-
+	log.Printf("✨ enterWithSLTP completed successfully")
 	return nil
 }
 
 // setupGuaranteedExit sets up guaranteed stop-loss and take-profit using conditional orders
 func (s *AdvancedTradingStrategy) setupGuaranteedExit(side types.OrderSide, filledPrice, filledSize float64) {
-	var slPrice, tpPrice float64
-	var closeSide types.OrderSide
-
-	if side == types.OrderSideBuy {
-		// For long: stop-loss 1.5% below entry, take-profit 1.5% above entry (1:1 ratio with rewardRatio=1.0)
-		slPrice = filledPrice * 0.985 // 1.5% below
-		tpPrice = filledPrice * 1.015 // 1.5% above
-		closeSide = types.OrderSideSell
-	} else {
-		// For short: stop-loss 1.5% above entry, take-profit 1.5% below entry (1:1 ratio with rewardRatio=1.0)
-		slPrice = filledPrice * 1.015 // 1.5% above
-		tpPrice = filledPrice * 0.985 // 1.5% below
-		closeSide = types.OrderSideBuy
+	// Check if filledPrice is valid
+	if filledPrice <= 0 {
+		log.Printf("⚠️ Invalid filled price for exit setup: %.4f – skipping algo order", filledPrice)
+		return
 	}
 
+	// If ATR trailing stop is enabled, we'll handle SL differently
+	if s.config.UseATRTrailingStop {
+		// For ATR trailing stop: we'll set up initial SL and then update it via updateTrailingStops
+		// Calculate initial SL based on ATR settings
+		var slPrice float64
+		var closeSide types.OrderSide
+
+		if side == types.OrderSideBuy {
+			// For long: stop-loss at entry price minus ATR-based distance
+			initialATR := s.calculateATR([]float64{filledPrice * 1.02, filledPrice * 0.98, filledPrice * 0.99}, 
+										  []float64{filledPrice * 0.98, filledPrice * 0.96, filledPrice * 0.97}, 
+										  []float64{filledPrice, filledPrice * 0.97, filledPrice * 0.98}, 2) // dummy values just for initial calculation
+			initialTrailDist := initialATR * s.config.TrailATRMult
+			slPrice = filledPrice - initialTrailDist
+			closeSide = types.OrderSideSell
+		} else {
+			// For short: stop-loss at entry price plus ATR-based distance
+			initialATR := s.calculateATR([]float64{filledPrice * 1.02, filledPrice * 0.98, filledPrice * 0.99}, 
+										  []float64{filledPrice * 0.98, filledPrice * 0.96, filledPrice * 0.97}, 
+										  []float64{filledPrice, filledPrice * 0.97, filledPrice * 0.98}, 2) // dummy values just for initial calculation
+			initialTrailDist := initialATR * s.config.TrailATRMult
+			slPrice = filledPrice + initialTrailDist
+			closeSide = types.OrderSideBuy
+		}
+
+		// Ensure SL is valid
+		if slPrice <= 0 {
+			log.Printf("⚠️ Invalid initial SL price calculated: %.4f – skipping algo order", slPrice)
+			return
+		}
+
+		var posSide string
+		if closeSide == types.OrderSideBuy {
+			posSide = "long" // When closing a short, we're buying (long) to close
+		} else {
+			posSide = "short" // When closing a long, we're selling (short) to close
+		}
+
+		// For ATR trailing: Check if isolated balance is sufficient for stop-loss order
+		if s.config.AllInMode { // Only check for AllInMode which uses isolated
+			isoBal, err := s.restClient.GetIsolatedBalance(s.instrumentID)
+			if err != nil {
+				log.Printf("⚠️ Could not get isolated balance, proceeding anyway: %v", err)
+			} else {
+				// Calculate required margin for stop-loss (approximately 1% of position nominal)
+				requiredMargin := filledSize * slPrice * 0.01
+				if isoBal < requiredMargin {
+					log.Printf("⚠️ Insufficient USDT in isolated account for stop-loss: need %.2f, available %.2f", 
+						requiredMargin, isoBal)
+					return // Skip creating stop-loss if not enough margin
+				}
+			}
+		}
+
+		// Create conditional SL order
+		algoOrder := &types.AlgoOrderRequest{
+			InstID:      s.instrumentID,
+			TdMode:      "isolated", // Use isolated mode to avoid cross margin issues
+			Side:        closeSide,
+			PosSide:     posSide, // Position side for the order
+			Size:        filledSize,
+			SlTriggerPx: slPrice, // Use the correct field
+			SlOrdPx:     "-1",    // Market order for stop loss execution
+			OrderType:   "conditional",
+			ClOrdID:     fmt.Sprintf("atrsl%d%04d", time.Now().Unix(), rand.Intn(10000)), // Special prefix for ATR SL
+		}
+
+		response, err := s.restClient.PlaceAlgoOrder(algoOrder)
+		if err != nil || response.Code != "0" {
+			log.Printf("⚠️ Initial ATR SL order not set: %v", err)
+			log.Printf("❌ Algo order response: %+v", response)
+		} else {
+			log.Printf("✅ Initial ATR SL set at %.4f (ID: %s)", slPrice, response.Data[0].OrderID)
+		}
+	} else {
+		// Original logic for non-ATR trailing
+		// Calculate initial SL based on entry price (for trailing stop)
+		var slPrice float64
+		var closeSide types.OrderSide
+
+		if side == types.OrderSideBuy {
+			// For long: stop-loss 1.5% below entry price (for initial setup)
+			slPrice = math.Round((filledPrice * 0.985) * 100) / 100 // 1.5% below, rounded to 0.01
+			closeSide = types.OrderSideSell
+		} else {
+			// For short: stop-loss 1.5% above entry price (for initial setup)
+			slPrice = math.Round((filledPrice * 1.015) * 100) / 100 // 1.5% above, rounded to 0.01
+			closeSide = types.OrderSideBuy
+		}
+
+		// Check if calculated SL price is valid
+		if slPrice <= 0 {
+			log.Printf("⚠️ Invalid SL price calculated: %.4f – skipping algo order", slPrice)
+			return
+		}
+
+		var posSide string
+		if closeSide == types.OrderSideBuy {
+			posSide = "long" // When closing a short, we're buying (long) to close
+		} else {
+			posSide = "short" // When closing a long, we're selling (short) to close
+		}
+		
+		// For trailing stop: Check if isolated balance is sufficient for stop-loss order
+		if s.config.AllInMode { // Only check for AllInMode which uses isolated
+			isoBal, err := s.restClient.GetIsolatedBalance(s.instrumentID)
+			if err != nil {
+				log.Printf("⚠️ Could not get isolated balance, proceeding anyway: %v", err)
+			} else {
+				// Calculate required margin for stop-loss (approximately 1% of position nominal)
+				requiredMargin := filledSize * slPrice * 0.01
+				if isoBal < requiredMargin {
+					log.Printf("⚠️ Insufficient USDT in isolated account for stop-loss: need %.2f, available %.2f", 
+						requiredMargin, isoBal)
+					return // Skip creating stop-loss if not enough margin
+				}
+			}
+		}
+
+		// For trailing stop: create only SL initially, TP will be managed separately if required
+		algoOrder := &types.AlgoOrderRequest{
+			InstID:      s.instrumentID,
+			TdMode:      "isolated", // Use isolated mode to avoid cross margin issues
+			Side:        closeSide,
+			PosSide:     posSide, // Position side for the order
+			Size:        filledSize,
+			SlTriggerPx: slPrice, // Use the correct field
+			SlOrdPx:     "-1",    // Market order for stop loss execution
+			OrderType:   "conditional",
+			ClOrdID:     fmt.Sprintf("sl%d%04d", time.Now().Unix(), rand.Intn(10000)),
+		}
+
+		response, err := s.restClient.PlaceAlgoOrder(algoOrder)
+		if err != nil || response.Code != "0" {
+			log.Printf("⚠️ Initial SL order not set: %v", err)
+			log.Printf("❌ Algo order response: %+v", response)
+		} else {
+			log.Printf("✅ Initial SL set at %.4f", slPrice)
+		}
+	}
+}
+
+// setupTakeProfit sets up guaranteed take-profit using conditional order
+func (s *AdvancedTradingStrategy) setupTakeProfit(side types.OrderSide, filledPrice, filledSize float64) {
+	// Check if filledPrice is valid
+	if filledPrice <= 0 {
+		log.Printf("⚠️ Invalid filled price for TP setup: %.4f – skipping algo order", filledPrice)
+		return
+	}
+
+	// Calculate TP price based on entry price
+	var tpPrice float64
+	var closeSide types.OrderSide
+
+	// Calculate minimum profit in USD to cover commission
+	minProfitUSD := s.config.MinTakeProfitUSD
+	if minProfitUSD <= 0 {
+		minProfitUSD = 0.10 // default minimum 0.10 USDT
+	}
+
+	// Calculate minimum distance based on minimum profit
+	minDistance := minProfitUSD / filledSize
+	if minDistance <= 0 {
+		minDistance = 0.02 * filledPrice // fallback to 2% if calculation is invalid
+	}
+
+	if side == types.OrderSideBuy {
+		// For long: take-profit with minimum distance above entry price
+		tpPrice = filledPrice + minDistance
+		closeSide = types.OrderSideSell
+	} else {
+		// For short: take-profit with minimum distance below entry price
+		tpPrice = filledPrice - minDistance
+		closeSide = types.OrderSideBuy
+	}
+	
+	// Round to tick size (0.01 for most USDT pairs)
+	tpPrice = math.Round(tpPrice*100) / 100
+
+	// Check if calculated TP price is valid
+	if tpPrice <= 0 {
+		log.Printf("⚠️ Invalid TP price calculated: %.4f – skipping algo order", tpPrice)
+		return
+	}
+
+	var posSide string
+	if closeSide == types.OrderSideBuy {
+		posSide = "long"
+	} else {
+		posSide = "short"
+	}
+
+	// Check isolated balance (same as for SL)
+	if s.config.AllInMode {
+		isoBal, err := s.restClient.GetIsolatedBalance(s.instrumentID)
+		if err != nil {
+			log.Printf("⚠️ Could not get isolated balance for TP: %v", err)
+		} else {
+			requiredMargin := filledSize * tpPrice * 0.01 // 1% от номинала
+			if isoBal < requiredMargin {
+				log.Printf("⚠️ Insufficient USDT in isolated for TP: need %.2f, available %.2f – skipping", requiredMargin, isoBal)
+				return
+			}
+		}
+	}
+
+	// Determine order execution price based on exit type
+	var tpOrdPx string
+	if s.config.UseLimitOrdersForExit {
+		// For limit order execution
+		orderBook, err := s.restClient.GetOrderBook(s.instrumentID, 1)
+		if err == nil && len(orderBook.Asks) > 0 && len(orderBook.Bids) > 0 {
+			if side == types.OrderSideBuy {
+				// For long position, we sell - use best ask price if better than our TP
+				bestAsk, _ := strconv.ParseFloat(orderBook.Asks[0][0], 64)
+				if tpPrice > bestAsk {
+					tpPrice = bestAsk - 0.01 // slightly better than market for faster fill
+				}
+			} else {
+				// For short position, we buy - use best bid price if better than our TP
+				bestBid, _ := strconv.ParseFloat(orderBook.Bids[0][0], 64)
+				if tpPrice < bestBid {
+					tpPrice = bestBid + 0.01 // slightly better than market for faster fill
+				}
+			}
+		}
+		tpOrdPx = fmt.Sprintf("%.2f", tpPrice) // limit execution at specific price
+	} else {
+		tpOrdPx = "-1" // market execution
+	}
+
+	// Create conditional TP order
 	algoOrder := &types.AlgoOrderRequest{
-		InstID:     s.instrumentID,
-		TdMode:     "cross", // Cross margin mode to match entry order
-		Side:       closeSide,
-		Size:       filledSize,
-		StopLoss:   slPrice,
-		TakeProfit: tpPrice,
-		OrderType:  "conditional",
+		InstID:      s.instrumentID,
+		TdMode:      "isolated",
+		Side:        closeSide,
+		PosSide:     posSide,
+		Size:        filledSize,
+		TpTriggerPx: tpPrice,
+		TpOrdPx:     tpOrdPx,
+		OrderType:   "conditional",
+		ClOrdID:     fmt.Sprintf("tp%d%04d", time.Now().Unix(), rand.Intn(10000)),
 	}
 
 	response, err := s.restClient.PlaceAlgoOrder(algoOrder)
 	if err != nil || response.Code != "0" {
-		log.Printf("⚠️ Guaranteed exit orders not set: %v", err)
-		log.Printf("❌ Algo order response: %+v", response)
+		log.Printf("⚠️ TP order not set: %v", err)
+		log.Printf("❌ TP algo order response: %+v", response)
 	} else {
-		log.Printf("✅ Guaranteed exit set - SL: %.4f, TP: %.4f", 
-			slPrice, tpPrice)
+		log.Printf("✅ TP set at %.4f (size: %.3f, exit type: %s)", tpPrice, filledSize, 
+			map[bool]string{true: "limit", false: "market"}[s.config.UseLimitOrdersForExit])
 	}
 }
 
-// setupTrailingStop sets up a trailing stop order
+// setupTrailingStop sets up a native trailing stop order using move_order_stop
 func (s *AdvancedTradingStrategy) setupTrailingStop(side types.OrderSide, filledPrice, filledSize, slDistance float64) {
-	var triggerPrice float64
+	var activationPx float64
 	var closeSide types.OrderSide
 
+	// For long positions, activationPx is the highest price (peak)
+	// For short positions, activationPx is the lowest price (peak)
 	if side == types.OrderSideBuy {
-		triggerPrice = filledPrice - slDistance
+		activationPx = filledPrice // For long, we start tracking from entry price as initial peak
 		closeSide = types.OrderSideSell
 	} else {
-		triggerPrice = filledPrice + slDistance
+		activationPx = filledPrice // For short, we start tracking from entry price as initial peak
 		closeSide = types.OrderSideBuy
 	}
 
-	trailResp, err := s.restClient.PlaceTrailingStop(s.instrumentID, closeSide, filledSize, triggerPrice)
+	callbackRatio := s.config.TrailingPercent / 100.0 // Convert percentage to ratio
+
+	tdMode := s.config.TdMode // Use the strategy's margin mode ("cross" or "isolated")
+	trailResp, err := s.restClient.PlaceTrailingStop(s.instrumentID, tdMode, closeSide, filledSize, activationPx, callbackRatio)
 	if err != nil || trailResp.Code != "0" {
-		log.Printf("⚠️ Trailing stop not set: %v", err)
+		log.Printf("⚠️ Native trailing stop not set: %v", err)
 	} else {
-		log.Printf("✅ Trailing stop set at %.2f", triggerPrice)
+		log.Printf("✅ Native trailing stop set - activation: %.4f callback: %.2f%%", activationPx, s.config.TrailingPercent)
 	}
 }
 
@@ -781,7 +1370,7 @@ func (s *AdvancedTradingStrategy) ensureCrossUSDT(need float64) error {
 			log.Printf("⚠️ Could not get funding balance: %v", err)
 			fundingBalance = 0
 		}
-		
+
 		transferAmt := need + 0.5 // Adding buffer
 		if transferAmt > fundingBalance {
 			transferAmt = fundingBalance // don't transfer more than available
@@ -808,7 +1397,6 @@ func (s *AdvancedTradingStrategy) ensureCrossUSDT(need float64) error {
 	return s.restClient.TransferToMargin("USDT", transferAmt)
 }
 
-
 // GetPositions returns all positions (active and closed)
 func (s *AdvancedTradingStrategy) GetPositions() []*types.Position {
 	s.positionsMu.RLock()
@@ -820,6 +1408,16 @@ func (s *AdvancedTradingStrategy) GetPositions() []*types.Position {
 	}
 	positions = append(positions, s.closedPositions...)
 	return positions
+}
+
+// SetTrailingManager sets the trailing manager for the strategy
+func (s *AdvancedTradingStrategy) SetTrailingManager(manager interface{}) {
+	s.trailingManager = manager
+}
+
+// SetInitialBalance sets the initial balance for fixed risk management
+func (s *AdvancedTradingStrategy) SetInitialBalance(balance float64) {
+	s.initialBalance = balance
 }
 
 // EnterAllIn implements the all-in entry method
@@ -841,8 +1439,8 @@ type AllInExecutor struct {
 
 // EnterLongShort вычисляет максимальный объём и ставит рыночный или лимитный ордер
 func (e *AllInExecutor) EnterLongShort(ctx context.Context, side types.OrderSide, orderType string) error {
-	// 1. Установим плечо 1× в cross режиме
-	_ = e.rest.SetLeverage(e.instID, "cross", 1, "")
+	// 1. Установим плечо 1× в isolated режиме (posSide не нужен в isolated режиме) - для избежания cross margin проблем
+	_ = e.rest.SetLeverage(e.instID, "isolated", 1, "")
 
 	// 2. Баланс USDT (в Unified/Portfolio режиме)
 	bal, err := e.rest.GetBalance("USDT")
@@ -862,9 +1460,10 @@ func (e *AllInExecutor) EnterLongShort(ctx context.Context, side types.OrderSide
 	price := tick.Last
 
 	// 4. Размер контракта - используем все доступные средства с запасом
-	contractVal := 0.1 // минимальный размер для фьючерсов
-	maxSize := (avail - 0.6) / price // вычитаем 0.6 на комиссии и запас
-	size := math.Floor((maxSize - 0.1)/contractVal) * contractVal // округляем вниз до 0.1 с запасом 0.1$
+	const stopLossBuffer = 5.0                                   // USDT buffer for stop-loss collateral in isolated mode
+	contractVal := 0.1                                          // минимальный размер для фьючерсов
+	maxSize := (avail - 0.6 - stopLossBuffer) / price           // вычитаем 0.6 на комиссии и stopLossBuffer на залог
+	size := math.Floor((maxSize-0.1)/contractVal) * contractVal // округляем вниз до 0.1 с запасом 0.1$
 	if size < contractVal {
 		size = contractVal
 	}
@@ -872,13 +1471,13 @@ func (e *AllInExecutor) EnterLongShort(ctx context.Context, side types.OrderSide
 	// Check for low liquidity by attempting to get order book
 	orderBook, err := e.rest.GetOrderBook(e.instID, 1) // Get top of book
 	lowLiquidity := err != nil || len(orderBook.Asks) == 0 || len(orderBook.Bids) == 0
-	
+
 	// If order book is empty or error occurred, it's low liquidity situation
 	if lowLiquidity && orderType == "limit" {
 		log.Printf("⚠️ Low liquidity detected - switching to market order for %s", side)
 		orderType = "market" // Force market order when liquidity is low
 	}
-	
+
 	// 5. Вычисляем цену для лимитного ордера, если тип ордера - limit
 	var pricePtr *float64 = nil
 	if orderType == "limit" {
@@ -900,7 +1499,7 @@ func (e *AllInExecutor) EnterLongShort(ctx context.Context, side types.OrderSide
 		} else {
 			// Use prices from the order book
 			if side == types.OrderSideBuy {
-				// For buy orders, use the best ask price (lowest sell price) 
+				// For buy orders, use the best ask price (lowest sell price)
 				askPriceStr := orderBook.Asks[0][0] // First element is price
 				askPrice, err := strconv.ParseFloat(askPriceStr, 64)
 				if err != nil {
@@ -927,19 +1526,19 @@ func (e *AllInExecutor) EnterLongShort(ctx context.Context, side types.OrderSide
 				}
 			}
 		}
-		
+
 		// Проверяем минимальный номинал для лимитных ордеров
 		// OKX требует минимальный номинал ~20 USDT для лимитных ордеров на фьючерсах
-		minNotional := 20.0 // OKX лимит для фьючерсных инструментов
+		minNotional := 20.0          // OKX лимит для фьючерсных инструментов
 		notional := size * *pricePtr // номинал = размер * цена
-		
+
 		if notional < minNotional {
 			log.Printf("⚠️  Лимитный номинал %.2f < %.2f USDT – переключаемся на рыночный", notional, minNotional)
 			orderType = "market" // переключаемся на рыночный ордер
-			pricePtr = nil // у рыночного ордера цена не указывается
+			pricePtr = nil       // у рыночного ордера цена не указывается
 		} else {
 			log.Printf("📊 Limit price calculated: %.4f for %s order (nominal: %.2f USDT)", *pricePtr, side, notional)
-			
+
 			// Дополнительная проверка: если номинал < 25 USD – force market, чтобы избежать "All operations failed"
 			// OKX может отклонить лимитные ордера даже с номиналом > 1 USD из-за широкого спреда или малого объёма
 			if notional < 25.0 {
@@ -949,25 +1548,33 @@ func (e *AllInExecutor) EnterLongShort(ctx context.Context, side types.OrderSide
 			}
 		}
 	}
-	
-	// Если это рыночный ордер и номинал < 55 USD – увеличиваем размер до 55 USD
+
+	// Если это рыночный ордер и номинал < 25 USD – увеличиваем размер до 25 USD (понижен с 55 для поддержки низких балансов)
 	if orderType == "market" {
 		nominal := size * price
-		if nominal < 55.0 {
+		if nominal < 25.0 {
 			contractVal := 0.1 // минимальный размер контракта для фьючерсов
-			size = math.Ceil(55.0 / price / contractVal) * contractVal
-			log.Printf("⚠  Nominal < 55 USD – increased size to %.4f (nominal: %.2f USDT)", size, size*price)
+			size = math.Ceil(25.0/price/contractVal) * contractVal
+			log.Printf("⚠  Nominal < 25 USD – increased size to %.4f (nominal: %.2f USDT)", size, size*price)
 		}
 	}
 
-	// Ордер в режиме «cross» с 1× плечом
+	// Ордер в режиме «isolated» с 1× плечом
+	// Determine posSide based on order side
+	posSide := "long"
+	if side == types.OrderSideSell {
+		posSide = "short"
+	}
+
 	order := &types.OrderRequest{
 		InstID:    e.instID,
-		TdMode:    "cross",        // ← не cash! для фьючерсов
+		TdMode:    "cross", // cross mode for all-in mode to use entire balance
 		Side:      side,
+		PosSide:   posSide, // Position side: long/short
 		OrderType: orderType,
 		Size:      size,
 		Price:     pricePtr,
+		ClOrdID:   fmt.Sprintf("allin%d%04d", time.Now().Unix(), rand.Intn(10000)),
 	}
 	resp, err := e.rest.PlaceOrder(order)
 	if err != nil {
@@ -990,6 +1597,137 @@ func (s *AdvancedTradingStrategy) hasActivePosition() bool {
 		log.Printf("📋 Internal position - ID: %s, Side: %s, Size: %.3f, Status: %s", id, pos.Side, pos.Size, pos.Status)
 	}
 	return activeCount > 0
+}
+
+// poll15mCandles polls 15-minute candles for RSI calculation
+func (s *AdvancedTradingStrategy) poll15mCandles() {
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			log.Println("Stopping 15m candle polling")
+			return
+		case <-ticker.C:
+			// Get the latest 15m candle
+			candles, err := s.marketDataService.GetHistoricalDataForTimeframe(50, "15m")
+			if err != nil {
+				log.Printf("❌ Failed to get 15m candles: %v", err)
+				continue
+			}
+
+			// Add candles to the 15m buffer
+			for _, candle := range candles {
+				// Skip if the candle has zero values
+				if candle.Close == 0 || candle.Volume == 0 {
+					continue
+				}
+				s.candleBuffer15m.PushBack(candle)
+			}
+
+			// Calculate RSI on 15m candles
+			s.updateRSI15m()
+		}
+	}
+}
+
+// On30mCandle receives 30-minute candle updates from WebSocket
+func (s *AdvancedTradingStrategy) On30mCandle(c *types.Candle) {
+	if !c.IsCompleted() { // используем только после официального закрытия
+		return
+	}
+	// --- защита от дублей ---
+	if s.last30mCandle != nil && c.Timestamp.Equal(s.last30mCandle.Timestamp) {
+		return
+	}
+	// -----------------------
+	
+	// Add the new 30-minute candle to the buffer (don't clear previous data)
+	s.candleBuffer30m.PushBack(c)
+	s.last30mCandle = c
+	
+	// Limit buffer size to prevent memory issues
+	if s.candleBuffer30m.Size() > 100 {
+		// Remove oldest candle if buffer exceeds 100 candles
+		_ = s.candleBuffer30m.Get(0)
+	}
+	
+	log.Printf("📊 30m candle CLOSED: O=%.2f H=%.2f L=%.2f C=%.2f V=%.1f (bars=%d)",
+		c.Open, c.High, c.Low, c.Close, c.Volume, s.candleBuffer30m.Size())
+}
+
+// poll30mCandlesREST polls 30-minute candles via REST API
+func (s *AdvancedTradingStrategy) poll30mCandlesREST() {
+	// This method is now deprecated in favor of WebSocket-based 30m candles
+	// Keep it for backward compatibility but it won't be called by default
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			log.Println("Stopping 30m candle polling")
+			return
+		case <-ticker.C:
+			candles, err := s.restClient.GetHistoricalCandles(s.instrumentID, "30m", 50)
+			if err != nil || len(candles) == 0 {
+				log.Printf("⚠️ 30m poll error: %v", err)
+				continue
+			}
+			// берём ПОСЛЕДНЮЮ завершённую 30-минутку
+			last := candles[len(candles)-1]
+			if last.IsCompleted() {
+				s.candleBuffer30m.Clear()
+				for _, c := range candles {
+					s.candleBuffer30m.PushBack(c)
+				}
+				s.last30mCandle = last
+				log.Printf("📊 30m data updated: O=%.2f H=%.2f L=%.2f C=%.2f V=%.1f",
+					last.Open, last.High, last.Low, last.Close, last.Volume)
+			}
+		}
+	}
+}
+
+// updateRSI15m calculates RSI using 15-minute candles
+func (s *AdvancedTradingStrategy) updateRSI15m() {
+	s.candleBuffer15m.mu.RLock()
+	defer s.candleBuffer15m.mu.RUnlock()
+
+	// Need at least 2 candles for RSI calculation
+	if s.candleBuffer15m.count < 2 {
+		return
+	}
+
+	// Extract close prices
+	candles := s.candleBuffer15m.ToSlice()
+	closes := make([]float64, len(candles))
+	for i, c := range candles {
+		closes[i] = c.Close
+	}
+
+	// Calculate RSI
+	rsiValues := s.calculateRSI(closes, s.rsiLength)
+
+	// Store the latest RSI value
+	s.rsi15mMu.Lock()
+	defer s.rsi15mMu.Unlock()
+	if len(rsiValues) > 0 {
+		s.rsi15m = rsiValues
+		log.Printf("📊 15m RSI updated: %.2f", rsiValues[len(rsiValues)-1])
+	}
+}
+
+// getLatestRSI15m returns the latest 15-minute RSI value
+func (s *AdvancedTradingStrategy) getLatestRSI15m() (float64, bool) {
+	s.rsi15mMu.RLock()
+	defer s.rsi15mMu.RUnlock()
+
+	if len(s.rsi15m) == 0 {
+		return 0, false
+	}
+
+	return s.rsi15m[len(s.rsi15m)-1], true
 }
 
 // checkStopConditions checks stop loss and take profit conditions
@@ -1026,23 +1764,254 @@ func (s *AdvancedTradingStrategy) updateTrailingStops(currentPrice float64) {
 	s.positionsMu.Lock()
 	defer s.positionsMu.Unlock()
 
+	// Don't process trailing stops if no active positions exist
+	if len(s.activePositions) == 0 {
+		return // nothing to trail
+	}
+
 	for id, pos := range s.activePositions {
-		if !pos.IsTrailingStop {
-			continue
-		}
+		// Handle ATR trailing stops with amend API - классический трейлинг стоп
+		if s.config.UseATRTrailingStop {
+			// TRUE ATR TRAILING: Calculate dynamic ATR trailing stop based on most recent candles
+			candles := s.candleBuffer.ToSlice()
+			if len(candles) >= s.atrLength { // Use the configured ATR length instead of fixed ATR(2)
+				// Extract the most recent candles for ATR calculation
+				startIdx := len(candles) - s.atrLength
+				highs := make([]float64, s.atrLength)
+				lows := make([]float64, s.atrLength)
+				closes := make([]float64, s.atrLength)
+				
+				for i := 0; i < s.atrLength; i++ {
+					candle := candles[startIdx+i]
+					highs[i] = candle.High
+					lows[i] = candle.Low
+					closes[i] = candle.Close
+				}
+				
+				// Calculate current ATR using the full ATR length
+				currentATR := s.calculateATR(highs, lows, closes, s.atrLength)
+				trailDistance := currentATR * s.config.TrailATRMult
 
-		var newStop float64
-		if pos.Side == types.OrderSideBuy {
-			newStop = currentPrice * (1 - s.trailingStopPercent/100.0)
-		} else {
-			newStop = currentPrice * (1 + s.trailingStopPercent/100.0)
-		}
+				// Update the peak price for trailing
+				if (pos.Side == types.OrderSideBuy && currentPrice > pos.PeakPrice) ||
+					(pos.Side == types.OrderSideSell && currentPrice < pos.PeakPrice) {
+					pos.PeakPrice = currentPrice
+				}
 
-		// Only update if the new stop is better
-		if (pos.Side == types.OrderSideBuy && newStop > pos.StopLoss) ||
-			(pos.Side == types.OrderSideSell && newStop < pos.StopLoss) {
-			pos.StopLoss = newStop
-			s.activePositions[id] = pos
+				// Calculate new stop based on peak and current ATR distance
+				var newStop float64
+				if pos.Side == types.OrderSideBuy {
+					newStop = pos.PeakPrice - trailDistance
+				} else {
+					newStop = pos.PeakPrice + trailDistance // for short
+				}
+
+				// Update stop only if it improves the position (tighter stop)
+				if (pos.Side == types.OrderSideBuy && newStop > pos.StopLoss) ||
+					(pos.Side == types.OrderSideSell && newStop < pos.StopLoss) {
+					
+					// Only update if the price change is significant enough to avoid excessive API calls
+					priceDiff := math.Abs(newStop - pos.StopLoss)
+					if priceDiff >= 0.01 { // Minimum 0.01 USDT change threshold
+						// Update stop on the exchange level if we have a conditional order ID
+						if pos.StopLossAlgoID != "" {
+							// Use amend API to update the existing SL order instead of canceling and replacing
+							triggerPx := newStop
+							// Pass nil for orderPx to indicate market execution (-1)
+							response, err := s.restClient.AmendAlgoOrder(
+								s.instrumentID,
+								pos.StopLossAlgoID,
+								"conditional",
+								&triggerPx,
+								nil, // Market execution
+							)
+							
+							if err != nil {
+								log.Printf("⚠️ Failed to amend SL order: %v", err)
+								// Fallback to cancel and replace approach
+								_, cancelErr := s.restClient.CancelAlgoOrder(pos.StopLossAlgoID, s.instrumentID)
+								if cancelErr != nil {
+									log.Printf("⚠️ Could not cancel old SL algo order: %v", cancelErr)
+								} else {
+									log.Printf("🔄 Cancelled old SL algo order: %s", pos.StopLossAlgoID)
+									
+									// Place new SL order with updated price
+									var closeSide types.OrderSide
+									var posSide string
+									if pos.Side == types.OrderSideBuy {
+										closeSide = types.OrderSideSell
+										posSide = "short"
+									} else {
+										closeSide = types.OrderSideBuy
+										posSide = "long"
+									}
+
+									algoOrder := &types.AlgoOrderRequest{
+										InstID:      s.instrumentID,
+										TdMode:      "isolated",
+										Side:        closeSide,
+										PosSide:     posSide,
+										Size:        pos.Size,
+										SlTriggerPx: newStop,
+										SlOrdPx:     "-1",    // Market order execution
+										OrderType:   "conditional",
+										ClOrdID:     fmt.Sprintf("atrsl%d%04d", time.Now().Unix(), rand.Intn(10000)),
+									}
+
+									response, err := s.restClient.PlaceAlgoOrder(algoOrder)
+									if err != nil || response.Code != "0" {
+										log.Printf("⚠️ Failed to place updated SL order: %v", err)
+									} else {
+										// Store the new order ID
+										pos.StopLossAlgoID = response.Data[0].OrderID
+										pos.StopLoss = newStop
+										s.activePositions[id] = pos
+										log.Printf("✅ Updated ATR trailing SL order placed at %.4f (ID: %s) - ATR: %.4f, Distance: %.4f", 
+											newStop, pos.StopLossAlgoID, currentATR, trailDistance)
+									}
+								}
+							} else if response.Code != "0" {
+								log.Printf("⚠️ Amend SL order failed with code %s: %s", response.Code, response.Message)
+								// Fallback to cancel and replace approach
+								_, cancelErr := s.restClient.CancelAlgoOrder(pos.StopLossAlgoID, s.instrumentID)
+								if cancelErr != nil {
+									log.Printf("⚠️ Could not cancel old SL algo order: %v", cancelErr)
+								} else {
+									log.Printf("🔄 Cancelled old SL algo order: %s", pos.StopLossAlgoID)
+									
+									// Place new SL order with updated price
+									var closeSide types.OrderSide
+									var posSide string
+									if pos.Side == types.OrderSideBuy {
+										closeSide = types.OrderSideSell
+										posSide = "short"
+									} else {
+										closeSide = types.OrderSideBuy
+										posSide = "long"
+									}
+
+									algoOrder := &types.AlgoOrderRequest{
+										InstID:      s.instrumentID,
+										TdMode:      "isolated",
+										Side:        closeSide,
+										PosSide:     posSide,
+										Size:        pos.Size,
+										SlTriggerPx: newStop,
+										SlOrdPx:     "-1",    // Market order execution
+										OrderType:   "conditional",
+										ClOrdID:     fmt.Sprintf("atrsl%d%04d", time.Now().Unix(), rand.Intn(10000)),
+									}
+
+									response, err := s.restClient.PlaceAlgoOrder(algoOrder)
+									if err != nil || response.Code != "0" {
+										log.Printf("⚠️ Failed to place updated SL order: %v", err)
+									} else {
+										// Store the new order ID
+										pos.StopLossAlgoID = response.Data[0].OrderID
+										pos.StopLoss = newStop
+										s.activePositions[id] = pos
+										log.Printf("✅ Updated ATR trailing SL order placed at %.4f (ID: %s) - ATR: %.4f, Distance: %.4f", 
+											newStop, pos.StopLossAlgoID, currentATR, trailDistance)
+									}
+								}
+							} else {
+								// Successfully amended the order
+								pos.StopLoss = newStop
+								s.activePositions[id] = pos
+								log.Printf("✅ Amended ATR trailing SL order to %.4f (ID: %s) - ATR: %.4f, Distance: %.4f", 
+									newStop, pos.StopLossAlgoID, currentATR, trailDistance)
+							}
+						} else {
+							// If no conditional order ID exists, update locally only
+							pos.StopLoss = newStop
+							s.activePositions[id] = pos
+							log.Printf("📊 Updated ATR trailing SL locally at %.4f - ATR: %.4f, Distance: %.4f", 
+								newStop, currentATR, trailDistance)
+						}
+					} else {
+						// Log when the trailing stop doesn't improve or change is too small (for debugging)
+						log.Printf("⏳ ATR trailing: No improvement or change too small (%.4f < 0.01) - current: %.4f, proposed: %.4f (ATR: %.4f)", 
+							priceDiff, pos.StopLoss, newStop, currentATR)
+					}
+				} else {
+					// Log when the trailing stop doesn't improve (for debugging)
+					log.Printf("⏳ ATR trailing: No improvement - current: %.4f, proposed: %.4f (ATR: %.4f)", 
+						pos.StopLoss, newStop, currentATR)
+				}
+			} else {
+				// Not enough candles for ATR calculation, log a message
+				log.Printf("⚠️ Not enough candles for ATR calculation (%d/%d)", len(candles), s.atrLength)
+			}
+		} else if s.config.PineMode && s.config.TrailingPercent > 0 {
+			// 1. проверяем касание TP
+			if !pos.TpReached {
+				if (pos.Side == types.OrderSideBuy  && currentPrice >= pos.TakeProfit) ||
+				   (pos.Side == types.OrderSideSell && currentPrice <= pos.TakeProfit) {
+					pos.TpReached = true
+					pos.PeakPrice = currentPrice
+					log.Printf("🎯 TP коснулся (%.4f) – трейлинг запущен", currentPrice)
+				}
+			}
+
+			// 2. трейлинг только после TP
+			if pos.TpReached {
+				// 0.3% trailing from the peak after TP touch
+				trailDist := pos.PeakPrice * s.config.TrailingPercent / 100 // 0.3 % from peak
+				newPeak := pos.PeakPrice
+				if (pos.Side == types.OrderSideBuy  && currentPrice > newPeak) ||
+				   (pos.Side == types.OrderSideSell && currentPrice < newPeak) {
+					newPeak = currentPrice
+				}
+
+				newSL := 0.0
+				if pos.Side == types.OrderSideBuy {
+					newSL = newPeak - trailDist
+					if newSL <= pos.EntryPrice { // не даём уйти в убыток
+						newSL = pos.EntryPrice + 0.01
+					}
+				} else {
+					newSL = newPeak + trailDist
+					if newSL >= pos.EntryPrice {
+						newSL = pos.EntryPrice - 0.01
+					}
+				}
+				newSL = math.Round(newSL*100) / 100
+
+				// двигаем стоп только в пользу
+				if (pos.Side == types.OrderSideBuy  && newSL > pos.StopLoss) ||
+				   (pos.Side == types.OrderSideSell && newSL < pos.StopLoss) {
+					pos.StopLoss = newSL
+					pos.PeakPrice = newPeak
+					log.Printf("⛓️  Трейлинг: %s  SL→%.4f  Пик→%.4f", pos.ID, newSL, newPeak)
+				}
+			}
+		} else if pos.IsTrailingStop {
+			var newStop float64
+			if pos.Side == types.OrderSideBuy {
+				newStop = currentPrice * (1 - s.trailingStopPercent/100.0)
+			} else {
+				newStop = currentPrice * (1 + s.trailingStopPercent/100.0)
+			}
+
+			// Check if newStop is valid before using it
+			if newStop <= 0 {
+				continue // Skip this position update if newStop is invalid
+			}
+
+			// Only update if the new stop is better
+			if (pos.Side == types.OrderSideBuy && newStop > pos.StopLoss) ||
+				(pos.Side == types.OrderSideSell && newStop < pos.StopLoss) {
+				// Only update if the price change is significant enough to avoid excessive API calls
+				priceDiff := math.Abs(newStop - pos.StopLoss)
+				if priceDiff >= 0.01 { // Minimum 0.01 USDT change threshold
+					pos.StopLoss = newStop
+					s.activePositions[id] = pos
+				} else {
+					// Log when the change is too small (for debugging)
+					log.Printf("⏳ Basic trailing: Change too small (%.4f < 0.01) - current: %.4f, proposed: %.4f", 
+						priceDiff, pos.StopLoss, newStop)
+				}
+			}
 		}
 	}
 }
@@ -1106,6 +2075,51 @@ func (s *AdvancedTradingStrategy) checkLiquidationRisk(currentPrice float64) {
 
 // closePositionImmediately закрывает позицию принудительно рыночным ордером
 func (s *AdvancedTradingStrategy) closePositionImmediately(instID string, currentPrice float64, reason string) {
+	// First, let's find the internal position to cancel any associated trailing stop
+	s.positionsMu.Lock()
+	for id, pos := range s.activePositions {
+		if s.instrumentID == instID { // Using the strategy's instrument ID
+			// Cancel trailing stop via manager if available
+			if s.trailingManager != nil {
+				if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
+					if err := mgr.CancelTrailingStop(pos); err != nil {
+						log.Printf("⚠️ Failed to cancel trailing stop via manager: %v", err)
+						// Fallback to direct cancellation
+						if pos.StopLossAlgoID != "" {
+							if ok, err := s.restClient.CancelAlgoOrder(pos.StopLossAlgoID, s.instrumentID); err != nil {
+								log.Printf("⚠️ Failed to cancel trailing algo %s: %v", pos.StopLossAlgoID, err)
+							} else if ok {
+								log.Printf("✅ Trailing algo %s cancelled", pos.StopLossAlgoID)
+							}
+						}
+					}
+				} else {
+					// Fallback to direct cancellation if manager is not available
+					if pos.StopLossAlgoID != "" {
+						if ok, err := s.restClient.CancelAlgoOrder(pos.StopLossAlgoID, s.instrumentID); err != nil {
+							log.Printf("⚠️ Failed to cancel trailing algo %s: %v", pos.StopLossAlgoID, err)
+						} else if ok {
+							log.Printf("✅ Trailing algo %s cancelled", pos.StopLossAlgoID)
+						}
+					}
+				}
+			} else {
+				// Fallback to direct cancellation if manager is not available
+				if pos.StopLossAlgoID != "" {
+					if ok, err := s.restClient.CancelAlgoOrder(pos.StopLossAlgoID, s.instrumentID); err != nil {
+						log.Printf("⚠️ Failed to cancel trailing algo %s: %v", pos.StopLossAlgoID, err)
+					} else if ok {
+						log.Printf("✅ Trailing algo %s cancelled", pos.StopLossAlgoID)
+					}
+				}
+			}
+			delete(s.activePositions, id)
+			s.closedPositions = append(s.closedPositions, pos)
+			break
+		}
+	}
+	s.positionsMu.Unlock()
+
 	// Получаем текущую позицию чтобы определить сторону
 	positions, err := s.restClient.GetPositions("SWAP")
 	if err != nil || len(positions) == 0 {
@@ -1129,22 +2143,30 @@ func (s *AdvancedTradingStrategy) closePositionImmediately(instID string, curren
 	// Закрываем позицию с типом ордера из конфигурации (по умолчанию market для быстрого закрытия)
 	var side types.OrderSide
 	if position.Side == "long" {
-		side = types.OrderSideSell  // Для закрытия лонга продаем
+		side = types.OrderSideSell // Для закрытия лонга продаем
 	} else {
-		side = types.OrderSideBuy   // Для закрытия шорта покупаем
+		side = types.OrderSideBuy // Для закрытия шорта покупаем
 	}
 
 	// Для закрытия при ликвидации всегда используем рыночный ордер для гарантированного исполнения
 	orderType := "market"
 	var pricePtr *float64 = nil // Не требуется для рыночного ордера
 
+	// Determine posSide based on order side for closing position
+	posSide := "long"
+	if side == types.OrderSideSell {
+		posSide = "short"
+	}
+
 	closeOrder := &types.OrderRequest{
 		InstID:    instID,
 		TdMode:    "cross", // Cross margin mode to match the position
 		Side:      side,
+		PosSide:   posSide, // Position side: long/short
 		OrderType: orderType,
 		Size:      position.Size, // Закрываем всю позицию
 		Price:     pricePtr,
+		ClOrdID:   fmt.Sprintf("close%d%04d", time.Now().Unix(), rand.Intn(10000)),
 	}
 
 	resp, err := s.restClient.PlaceOrder(closeOrder)
@@ -1160,25 +2182,80 @@ func (s *AdvancedTradingStrategy) closePositionImmediately(instID string, curren
 
 // closePosition closes a position and calculates P&L
 func (s *AdvancedTradingStrategy) closePosition(positionID string, position *types.Position, closePrice float64, reason string) {
-	// Calculate P&L
-	var pnl float64
-	if position.Side == types.OrderSideBuy {
-		pnl = (closePrice - position.EntryPrice) * position.Size
-	} else {
-		pnl = (position.EntryPrice - closePrice) * position.Size
+	// Отменяем трейлинг при закрытии
+	if position.StopLossAlgoID != "" {
+		if mgr, ok := s.trailingManager.(*TrailingStopManager); ok {
+			_ = mgr.CancelExecutedTrailing(position)
+		}
 	}
 
-	log.Printf("🚪 EXIT %s | Price=%.2f | Reason=%s | PnL=%.2f USDT",
-		positionID, closePrice, reason, pnl)
+	// Быстрый расчет P&L
+	pnl := (closePrice - position.EntryPrice) * position.Size
+	if position.Side == types.OrderSideSell {
+		pnl = -pnl
+	}
 
-	// Update position
 	now := time.Now()
 	position.Status = types.PositionStatusClosed
 	position.CloseTime = &now
 	position.ClosePrice = &closePrice
 	position.PnL = &pnl
 
-	// Move to closed positions
 	delete(s.activePositions, positionID)
 	s.closedPositions = append(s.closedPositions, position)
+	
+	log.Printf("🚪 EXIT %s | Price=%.2f | Reason=%s | PnL=%.2f USDT",
+		positionID, closePrice, reason, pnl)
+}
+
+func (s *AdvancedTradingStrategy) currentATR() float64 {
+	candles := s.candleBuffer.ToSlice()
+	if len(candles) < s.atrLength {
+		return 0
+	}
+	highs, lows, closes := make([]float64, len(candles)), make([]float64, len(candles)), make([]float64, len(candles))
+	for i, c := range candles {
+		highs[i], lows[i], closes[i] = c.High, c.Low, c.Close
+	}
+	return s.calculateATR(highs, lows, closes, s.atrLength)
+}
+
+// isCandleCompleted checks if the candle is completed based on the configured timeframe
+func (s *AdvancedTradingStrategy) isCandleCompleted(candle *types.Candle) bool {
+	// Parse timeframe to determine completion delay
+	timeframe := s.timeframe
+	var completionDelay time.Duration
+
+	switch timeframe {
+	case "1m":
+		completionDelay = 1 * time.Minute
+	case "3m":
+		completionDelay = 3 * time.Minute
+	case "5m":
+		completionDelay = 5 * time.Minute
+	case "15m":
+		completionDelay = 15 * time.Minute
+	case "30m":
+		completionDelay = 30 * time.Minute
+	case "1H":
+		completionDelay = 1 * time.Hour
+	case "4H":
+		completionDelay = 4 * time.Hour
+	default:
+		// Default to 30 minutes if timeframe is unknown
+		completionDelay = 30 * time.Minute
+	}
+
+	return candle.Timestamp.Add(completionDelay).Before(time.Now().UTC())
+}
+
+// extractHLCCandles extracts high, low, and close values from a slice of candles
+func extractHLCCandles(c []*types.Candle) (highs, lows, closes []float64) {
+	highs = make([]float64, len(c))
+	lows = make([]float64, len(c))
+	closes = make([]float64, len(c))
+	for i, candle := range c {
+		highs[i], lows[i], closes[i] = candle.High, candle.Low, candle.Close
+	}
+	return
 }
