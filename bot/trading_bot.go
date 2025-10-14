@@ -272,17 +272,32 @@ func (bot *TradingBot) PlaceManualOrder(side types.OrderSide, size float64) (boo
 		}
 	}
 
-	// Determine posSide based on order side
-	posSide := "long"
-	if side == types.OrderSideSell {
-		posSide = "short"
+	// Determine posSide based on trading mode
+	// For cross/isolated margin in single position mode, use "net"
+	// For hedge mode, use "long"/"short" based on the order side
+	tdMode := bot.config.Strategy.TdMode
+	if tdMode == "" {
+		tdMode = "cross" // Default to cross margin mode
+	}
+	
+	var posSide string
+	if tdMode == "cross" || tdMode == "isolated" {
+		// For single position mode (default), use "net"
+		posSide = "net"
+	} else {
+		// For hedge mode, use "long" for buy, "short" for sell
+		if side == types.OrderSideBuy {
+			posSide = "long"
+		} else {
+			posSide = "short"
+		}
 	}
 
 	order := &types.OrderRequest{
 		InstID:    bot.config.OKX.InstrumentID,
-		TdMode:    "cross", // Cross margin mode for futures trading
+		TdMode:    tdMode, // Trading mode: cross/isolated
 		Side:      side,
-		PosSide:   posSide, // Position side: long/short
+		PosSide:   posSide, // Position side: net/long/short
 		OrderType: orderType,
 		Size:      size,
 		Price:     price,

@@ -1,0 +1,42 @@
+{
+  "OKX": {
+    "ApiKey": "",
+    "ApiSecret": "",
+    "Passphrase": "",
+    "InstrumentId": "SOL-USDT-SWAP",
+    "Timeframe": "15m",
+    "RSITimeframe": "15m"
+  },
+  "Strategy": {
+    "RsiLength": 2,
+    "RsiOverbought": 80,
+    "RsiOversold": 20,
+
+    "ATRLength": 14,
+    "ATRMultiplierSL": 1.50,
+    "ATRMultiplierTP": 1.50,
+
+    "MinVolumeFilter": 0.0,
+    "CooldownBars": 1,
+
+    "UseTrailingStop": true,
+    "TrailingPercent": 0.2,
+
+    "EquityPercent": 80.0,
+    "RiskPercent": 80.0,
+
+    "PineMode": true,
+    "OrderType": "market",
+    "UseLimitOrdersForExit": false,
+    "TdMode": "cross",
+    "AllInMode": false,
+    "UseOCO": false,
+    "UseATRTrailingStop": false,
+    "DynamicATRMult": false,
+    "MinTakeProfitUSD": 0.90,
+    "StopLossPercent": 0.60,
+    "TakeProfitPercent": 0.90,
+    "TrailATRMult": 0.5,
+    "TrailPercent": 0.30
+  }
+}

@@ -63,6 +63,8 @@ type OKXMarketDataService struct {
 	retryCount      int
 	connected       bool
 	zeroCandleCount int
+	last15mTimestamp time.Time
+	last30mTimestamp time.Time
 }
 
 // NewOKXMarketDataService creates a new market data service
@@ -108,14 +110,14 @@ func (s *OKXMarketDataService) Initialize(ctx context.Context) error {
 	return nil
 }
 
-// GetHistoricalDataForTimeframe retrieves historical candle data for a specific timeframe via REST API
-func (s *OKXMarketDataService) GetHistoricalDataForTimeframe(limit int, timeframe string) ([]*types.Candle, error) {
-	return s.restClient.GetHistoricalCandles(s.instrumentID, timeframe, limit)
-}
-
 // GetHistoricalData retrieves historical candle data via REST API
 func (s *OKXMarketDataService) GetHistoricalData(limit int) ([]*types.Candle, error) {
 	return s.restClient.GetHistoricalCandles(s.instrumentID, s.timeframe, limit)
+}
+
+// GetHistoricalDataForTimeframe retrieves historical candle data for a specific timeframe via REST API
+func (s *OKXMarketDataService) GetHistoricalDataForTimeframe(limit int, timeframe string) ([]*types.Candle, error) {
+	return s.restClient.GetHistoricalCandles(s.instrumentID, timeframe, limit)
 }
 
 // connect establishes WebSocket connection
@@ -139,7 +141,11 @@ func (s *OKXMarketDataService) connect() error {
 	// Start ping ticker
 	s.pingTicker = time.NewTicker(PingInterval)
 
-	// Subscribe to public channels (no authentication needed for public channels)
+	// Authenticate and subscribe
+	if err := s.authenticate(); err != nil {
+		return fmt.Errorf("failed to authenticate: %w", err)
+	}
+
 	if err := s.subscribe(); err != nil {
 		return fmt.Errorf("failed to subscribe: %w", err)
 	}
@@ -193,6 +199,14 @@ func (s *OKXMarketDataService) subscribe() error {
 		})
 	}
 
+	// Subscribe to 15-minute channel if current timeframe is not 15m
+	if s.timeframe != "15m" {
+		subscribeArgs = append(subscribeArgs, map[string]interface{}{
+			"channel": "candle15m",
+			"instId":  instId,
+		})
+	}
+
 	subscribeMsg := map[string]interface{}{
 		"op":   "subscribe",
 		"args": subscribeArgs,
@@ -235,8 +249,19 @@ func (s *OKXMarketDataService) processMessage(msg map[string]interface{}) {
 	// Handle data messages
 	if arg, ok := msg["arg"].(map[string]interface{}); ok {
 		if channel, ok := arg["channel"].(string); ok {
+			// Handle ticker data
+			if channel == "tickers" {
+				if data, ok := msg["data"].([]interface{}); ok && len(data) > 0 {
+					if tickerData, ok := data[0].(map[string]interface{}); ok {
+						if lastStr, ok := tickerData["last"].(string); ok {
+							if lastPrice, err := strconv.ParseFloat(lastStr, 64); err == nil && s.onPriceUpdate != nil {
+								s.onPriceUpdate(lastPrice)
+							}
+						}
+					}
+				}
 			// Handle 30-minute candle data
-			if channel == "candle30m" {
+			} else if channel == "candle30m" {
 				if data, ok := msg["data"].([]interface{}); ok && len(data) > 0 {
 					if candleArray, ok := data[0].([]interface{}); ok && len(candleArray) >= 6 {
 						// Convert to string array for parsing
@@ -268,9 +293,18 @@ func (s *OKXMarketDataService) processMessage(msg map[string]interface{}) {
 							s.mu.Unlock()
 
 							// не прокидываем «живые» тики - только завершенные свечи
-							if !candle.IsCompleted() {
+							if !candle.IsCompleted30m() {
 								return
 							}
+							
+							// Проверяем, не обрабатывали ли мы уже эту свечу
+							s.mu.Lock()
+							if candle.Timestamp.Equal(s.last30mTimestamp) {
+								s.mu.Unlock()
+								return // уже обработали
+							}
+							s.last30mTimestamp = candle.Timestamp
+							s.mu.Unlock()
 
 							// Call specific 30-minute candle handler if available
 							if s.onCandleUpdateForTimeframe != nil {
@@ -290,10 +324,67 @@ func (s *OKXMarketDataService) processMessage(msg map[string]interface{}) {
 					}
 				}
 				return
-			}
+			// Handle 15-minute candle data
+			} else if channel == "candle15m" {
+				if data, ok := msg["data"].([]interface{}); ok && len(data) > 0 {
+					if candleArray, ok := data[0].([]interface{}); ok && len(candleArray) >= 6 {
+						// Convert to string array for parsing
+						candleStrings := make([]string, len(candleArray))
+						for i, v := range candleArray {
+							candleStrings[i] = fmt.Sprintf("%v", v)
+						}
 
+						// Create 15-minute candle from WebSocket data
+						if candle, err := types.NewCandleFromRaw(candleStrings); err == nil {
+							// Проверяем, является ли свеча нулевой
+							if candle.Close == 0 || candle.Volume == 0 {
+								s.mu.Lock()
+								s.zeroCandleCount++
+								log.Printf("⚠️ Zero 15m candle #%d подряд", s.zeroCandleCount)
+								if s.zeroCandleCount >= 5 {
+									log.Printf("🔄 5 zero-15m-candle подряд – перезапускаем WebSocket")
+									s.zeroCandleCount = 0
+									s.mu.Unlock()
+									go s.handleReconnection() // не блокируем обработку
+									return
+								}
+								s.mu.Unlock()
+								return
+							}
+							// Сброс счётчика при появлении нормальной свечи
+							s.mu.Lock()
+							s.zeroCandleCount = 0
+							s.mu.Unlock()
+
+							// не прокидываем «живые» тики - только завершенные свечи
+							if !candle.IsCompleted15m() {
+								return
+							}
+							
+							// Проверяем, не обрабатывали ли мы уже эту свечу
+							s.mu.Lock()
+							if candle.Timestamp.Equal(s.last15mTimestamp) {
+								s.mu.Unlock()
+								return // уже обработали
+							}
+							s.last15mTimestamp = candle.Timestamp
+							s.mu.Unlock()
+
+							// Call specific 15-minute candle handler if available
+							if s.onCandleUpdateForTimeframe != nil {
+								s.onCandleUpdateForTimeframe(candle, "15m")
+							}
+
+							// Also trigger price update with the close price from the candle
+							if s.onPriceUpdate != nil {
+								s.onPriceUpdate(candle.Close)
+							}
+						}
+					}
+				}
+				return
 			// Handle candle data for the main timeframe
-			if channel == "candle"+strings.ToLower(s.timeframe) {
+			} else if channel == "candle"+strings.ToLower(s.timeframe) {
 				if data, ok := msg["data"].([]interface{}); ok && len(data) > 0 {
 					if candleArray, ok := data[0].([]interface{}); ok && len(candleArray) >= 6 {
 						// Convert to string array for parsing
@@ -335,6 +426,7 @@ func (s *OKXMarketDataService) processMessage(msg map[string]interface{}) {
 				}
 			}
 		}
+
 	}
 }
 

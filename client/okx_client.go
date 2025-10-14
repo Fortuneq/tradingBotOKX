@@ -336,12 +336,12 @@ func (c *OKXRestClient) PlaceTrailingStop(instID string, tdMode string, closeSid
 		"instId":        instID,
 		"tdMode":        tdMode, // "cross" or "isolated"
 		"side":          string(closeSide),
-		"posSide":       mapPosSide(closeSide), // "long" / "short"
 		"ordType":       "move_order_stop",
 		"sz":            strconv.FormatFloat(size, 'f', -1, 64),
 		"activationPx":  strconv.FormatFloat(activationPrice, 'f', -1, 64),
 		"callbackRatio": strconv.FormatFloat(callbackRatio, 'f', -1, 64), // ratio (e.g. 0.015 = 1.5%)
 		"orderPx":       "-1", // market execution
+		"reduceOnly":    true, // ensure position is reduced/closed, not opened in opposite direction
 	}
 
 	// Create a separate send request function for algo orders to get proper response type
