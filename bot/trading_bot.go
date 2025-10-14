@@ -67,7 +67,6 @@ func NewTradingBot(cfg *config.Config) (*TradingBot, error) {
 		restClient,
 		&cfg.Strategy,
 		cfg.OKX.InstrumentID,
-		cfg.OKX.Timeframe,
 		500, // buffer size
 	)
 

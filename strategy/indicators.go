@@ -7,25 +7,31 @@ import (
 	"okx-trading-bot/types"
 )
 
-// calculateRSI calculates the Relative Strength Index
+// calculateRSI calculates the Relative Strength Index using standard methodology
 func (s *AdvancedTradingStrategy) calculateRSI(closes []float64, period int) []float64 {
-	if len(closes) < 2 || period <= 0 { // <-- достаточно 2 свечей для RSI(1)
+	if len(closes) < 2 || period <= 0 {
 		return []float64{}
 	}
 
 	rsi := make([]float64, len(closes))
+	
+	// Initialize the first RSI value after the initial period
+	if len(closes) < period+1 {
+		return rsi
+	}
+	
+	// Calculate initial average gain and loss using Simple Moving Average for the first period
 	var avgGain, avgLoss float64
-
-	// Calculate initial average gain and loss
 	for i := 1; i <= period; i++ {
 		diff := closes[i] - closes[i-1]
 		if diff > 0 {
 			avgGain += diff
 		} else {
-			avgLoss -= diff
+			avgLoss -= diff  // diff is negative, so subtracting negative = adding positive
 		}
 	}
-
+	
+	// Use SMA for initial values (as per standard RSI calculation)
 	avgGain /= float64(period)
 	avgLoss /= float64(period)
 
@@ -33,52 +39,63 @@ func (s *AdvancedTradingStrategy) calculateRSI(closes []float64, period int) []f
 	if avgLoss == 0 {
 		rsi[period] = 100
 	} else {
-		rsi[period] = 100 - (100 / (1 + avgGain/avgLoss))
+		rs := avgGain / avgLoss
+		rsi[period] = 100 - (100 / (1 + rs))
 	}
 
-	// Calculate subsequent RSI values using exponential moving average
+	// Calculate subsequent RSI values using the standard Wilder's smoothing method (EMA-like)
 	for i := period + 1; i < len(closes); i++ {
 		diff := closes[i] - closes[i-1]
 		var gain, loss float64
-
+		
 		if diff > 0 {
 			gain = diff
+			loss = 0
 		} else {
+			gain = 0
 			loss = -diff
 		}
 
+		// Wilder's smoothing: (previous_avg * (period-1) + current_value) / period
 		avgGain = (avgGain*float64(period-1) + gain) / float64(period)
 		avgLoss = (avgLoss*float64(period-1) + loss) / float64(period)
 
 		if avgLoss == 0 {
 			rsi[i] = 100
 		} else {
-			rsi[i] = 100 - (100 / (1 + avgGain/avgLoss))
+			rs := avgGain / avgLoss
+			rsi[i] = 100 - (100 / (1 + rs))
 		}
 	}
 
 	return rsi
 }
 
-// calculateRSIWithPeriod calculates the Relative Strength Index with a custom period
+// calculateRSIWithPeriod calculates the Relative Strength Index with a custom period using standard methodology
 func calculateRSIWithPeriod(closes []float64, period int) []float64 {
 	if len(closes) < 2 || period <= 0 {
 		return []float64{}
 	}
 
 	rsi := make([]float64, len(closes))
+	
+	// Initialize the first RSI value after the initial period
+	if len(closes) < period+1 {
+		return rsi
+	}
+	
+	// Calculate initial average gain and loss using Simple Moving Average for the first period
 	var avgGain, avgLoss float64
-
-	// Calculate initial average gain and loss
 	for i := 1; i <= period; i++ {
 		diff := closes[i] - closes[i-1]
 		if diff > 0 {
 			avgGain += diff
 		} else {
-			avgLoss -= diff
+			avgLoss -= diff  // diff is negative, so subtracting negative = adding positive
 		}
 	}
-
+	
+	// Use SMA for initial values (as per standard RSI calculation)
 	avgGain /= float64(period)
 	avgLoss /= float64(period)
 
@@ -86,27 +103,32 @@ func calculateRSIWithPeriod(closes []float64, period int) []float64 {
 	if avgLoss == 0 {
 		rsi[period] = 100
 	} else {
-		rsi[period] = 100 - (100 / (1 + avgGain/avgLoss))
+		rs := avgGain / avgLoss
+		rsi[period] = 100 - (100 / (1 + rs))
 	}
 
-	// Calculate subsequent RSI values using exponential moving average
+	// Calculate subsequent RSI values using the standard Wilder's smoothing method (EMA-like)
 	for i := period + 1; i < len(closes); i++ {
 		diff := closes[i] - closes[i-1]
 		var gain, loss float64
-
+		
 		if diff > 0 {
 			gain = diff
+			loss = 0
 		} else {
+			gain = 0
 			loss = -diff
 		}
 
+		// Wilder's smoothing: (previous_avg * (period-1) + current_value) / period
 		avgGain = (avgGain*float64(period-1) + gain) / float64(period)
 		avgLoss = (avgLoss*float64(period-1) + loss) / float64(period)
 
 		if avgLoss == 0 {
 			rsi[i] = 100
 		} else {
-			rsi[i] = 100 - (100 / (1 + avgGain/avgLoss))
+			rs := avgGain / avgLoss
+			rsi[i] = 100 - (100 / (1 + rs))
 		}
 	}
 
