@@ -35,44 +35,44 @@ const (
 
 // OrderRequest represents an order request
 type OrderRequest struct {
-	InstID         string          `json:"instId"`
-	TdMode         string          `json:"tdMode"` // Trading mode: cash for spot
-	Side           OrderSide       `json:"side"`
-	PosSide        string          `json:"posSide,omitempty"` // Position side: long/short (only required for hedge mode)
-	OrderType      string          `json:"ordType"`
-	Size           float64         `json:"sz,string"`
-	Price          *float64        `json:"px,string,omitempty"`
-	ClOrdID        string          `json:"clOrdId,omitempty"` // Client order ID for uniqueness
+	InstID    string    `json:"instId"`
+	TdMode    string    `json:"tdMode"` // Trading mode: cash for spot
+	Side      OrderSide `json:"side"`
+	PosSide   string    `json:"posSide,omitempty"` // Position side: long/short (only required for hedge mode)
+	OrderType string    `json:"ordType"`
+	Size      float64   `json:"sz,string"`
+	Price     *float64  `json:"px,string,omitempty"`
+	ClOrdID   string    `json:"clOrdId,omitempty"` // Client order ID for uniqueness
 	// новое поле – массив прицепленных алго-ордеров
 	AttachAlgoOrds []AttachAlgoOrd `json:"attachAlgoOrds,omitempty"`
 }
 
 // AttachAlgoOrd – один прицеплённый алго-ордер
 type AttachAlgoOrd struct {
-	AttachAlgoId string  `json:"attachAlgoId,omitempty"` // оставляем пустым
-	OrdType      string  `json:"ordType"`                // "conditional"
+	AttachAlgoId string    `json:"attachAlgoId,omitempty"` // оставляем пустым
+	OrdType      string    `json:"ordType"`                // "conditional"
 	Side         OrderSide `json:"side"`
-	PosSide      string  `json:"posSide"`
-	SlTriggerPx  float64 `json:"slTriggerPx,string,omitempty"`
-	SlOrdPx      string  `json:"slOrdPx,omitempty"`   // "-1"
-	TpTriggerPx  float64 `json:"tpTriggerPx,string,omitempty"`
-	TpOrdPx      string  `json:"tpOrdPx,omitempty"`   // "-1"
+	PosSide      string    `json:"posSide"`
+	SlTriggerPx  float64   `json:"slTriggerPx,string,omitempty"`
+	SlOrdPx      string    `json:"slOrdPx,omitempty"` // "-1"
+	TpTriggerPx  float64   `json:"tpTriggerPx,string,omitempty"`
+	TpOrdPx      string    `json:"tpOrdPx,omitempty"` // "-1"
 }
 
 // AlgoOrderRequest represents an algorithmic order request
 type AlgoOrderRequest struct {
-	InstID      string    `json:"instId"`
-	TdMode      string    `json:"tdMode"` // Trading mode: cash for spot
-	Side        OrderSide `json:"side"`
-	PosSide     string    `json:"posSide,omitempty"` // Position side: long/short (hedge mode) or net (one-way mode)
-	Size        float64   `json:"sz,string"`
-	OrderType   string    `json:"ordType"`        // "conditional" for SL/TP orders, "market" for entry with conditional exits
-	ClOrdID     string    `json:"clOrdId,omitempty"` // Client order ID for uniqueness
+	InstID    string    `json:"instId"`
+	TdMode    string    `json:"tdMode"` // Trading mode: cash for spot
+	Side      OrderSide `json:"side"`
+	PosSide   string    `json:"posSide,omitempty"` // Position side: long/short (hedge mode) or net (one-way mode)
+	Size      float64   `json:"sz,string"`
+	OrderType string    `json:"ordType"`           // "conditional" for SL/TP orders, "market" for entry with conditional exits
+	ClOrdID   string    `json:"clOrdId,omitempty"` // Client order ID for uniqueness
 	// Fields for conditional orders (SL/TP)
-	SlTriggerPx float64 `json:"slTriggerPx,string,omitempty"`  // Stop Loss Trigger Price
-	SlOrdPx     string  `json:"slOrdPx,omitempty"`             // Stop Loss Order Price ("-1" for market)
-	TpTriggerPx float64 `json:"tpTriggerPx,string,omitempty"`  // Take Profit Trigger Price
-	TpOrdPx     string  `json:"tpOrdPx,omitempty"`             // Take Profit Order Price ("-1" for market)
+	SlTriggerPx float64 `json:"slTriggerPx,string,omitempty"` // Stop Loss Trigger Price
+	SlOrdPx     string  `json:"slOrdPx,omitempty"`            // Stop Loss Order Price ("-1" for market)
+	TpTriggerPx float64 `json:"tpTriggerPx,string,omitempty"` // Take Profit Trigger Price
+	TpOrdPx     string  `json:"tpOrdPx,omitempty"`            // Take Profit Order Price ("-1" for market)
 }
 
 // OrderResponse represents an order response from API
@@ -116,16 +116,16 @@ type OrderInfo struct {
 	OrderID    string      `json:"ordId"`
 	InstID     string      `json:"instId"`
 	Side       OrderSide   `json:"side"`
-	Price      *float64    `json:"px,omitempty"`        // Change to pointer to handle empty values
-	Size       float64     `json:"sz,string"`           // Keep string tag for size since it's always a number
+	Price      *float64    `json:"px,omitempty"` // Change to pointer to handle empty values
+	Size       float64     `json:"sz,string"`    // Keep string tag for size since it's always a number
 	Status     OrderStatus `json:"state"`
 	CreateTime int64       `json:"-"`
-	AvgPx      *float64    `json:"avgPx,omitempty"`     // Add common fields that might be empty
-	Fee        *float64    `json:"fee,omitempty"`       // Add common fields that might be empty
-	PxUsd      *float64    `json:"pxUsd,omitempty"`     // Add common fields that might be empty
-	PxVol      *float64    `json:"pxVol,omitempty"`     // Add common fields that might be empty
-	SlOrdPx    *float64    `json:"slOrdPx,omitempty"`   // Add common fields that might be empty
-	TpOrdPx    *float64    `json:"tpOrdPx,omitempty"`   // Add common fields that might be empty
+	AvgPx      *float64    `json:"avgPx,omitempty"`   // Add common fields that might be empty
+	Fee        *float64    `json:"fee,omitempty"`     // Add common fields that might be empty
+	PxUsd      *float64    `json:"pxUsd,omitempty"`   // Add common fields that might be empty
+	PxVol      *float64    `json:"pxVol,omitempty"`   // Add common fields that might be empty
+	SlOrdPx    *float64    `json:"slOrdPx,omitempty"` // Add common fields that might be empty
+	TpOrdPx    *float64    `json:"tpOrdPx,omitempty"` // Add common fields that might be empty
 }
 
 // Custom unmarshaling to handle Unix timestamp in milliseconds
@@ -135,13 +135,13 @@ func (o *OrderInfo) UnmarshalJSON(data []byte) error {
 
 	aux := &struct {
 		CreateTime string  `json:"cTime"`
-		Price      *string `json:"px"`        // Temporarily store as string
-		AvgPx      *string `json:"avgPx"`     // Temporarily store as string
-		Fee        *string `json:"fee"`       // Temporarily store as string
-		PxUsd      *string `json:"pxUsd"`     // Temporarily store as string
-		PxVol      *string `json:"pxVol"`     // Temporarily store as string
-		SlOrdPx    *string `json:"slOrdPx"`   // Temporarily store as string
-		TpOrdPx    *string `json:"tpOrdPx"`   // Temporarily store as string
+		Price      *string `json:"px"`      // Temporarily store as string
+		AvgPx      *string `json:"avgPx"`   // Temporarily store as string
+		Fee        *string `json:"fee"`     // Temporarily store as string
+		PxUsd      *string `json:"pxUsd"`   // Temporarily store as string
+		PxVol      *string `json:"pxVol"`   // Temporarily store as string
+		SlOrdPx    *string `json:"slOrdPx"` // Temporarily store as string
+		TpOrdPx    *string `json:"tpOrdPx"` // Temporarily store as string
 		*Alias
 	}{
 		Alias: (*Alias)(o),
@@ -376,11 +376,13 @@ type Position struct {
 	StopLossAlgoID    string
 	TakeProfitAlgoID  string
 	// Дополнительные поля для трейлинга по Pine-скрипту
-	PeakPrice     float64  // Лучшая цена после входа
-	TrailOffset   float64  // Отступ для трейлинга (ATR * multiplier)
-	EntryATR      float64  // ATR на момент входа
-	LastLoggedSL  float64  `json:"-"` // последний залогированный уровень SL для трейлинга
-	TpReached     bool     `json:"-"` // флаг: коснулись TP
+	PeakPrice   float64 // Лучшая цена после входа
+	TrailOffset float64 // Отступ для трейлинга (ATR * multiplier)
+	// Поле для предотвращения повторного входа после трейлинг-стопа
+	TrailingStopTriggered bool    // Флаг срабатывания трейлинг-стопа
+	EntryATR              float64 // ATR на момент входа
+	LastLoggedSL          float64 `json:"-"` // последний залогированный уровень SL для трейлинга
+	TpReached             bool    `json:"-"` // флаг: коснулись TP
 }
 
 // TradingViewSignal represents a webhook signal from TradingView
