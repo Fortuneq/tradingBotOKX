@@ -1,181 +1,72 @@
-# OKX Trading Bot - RSI + VWAP Strategy
+# OKX Trading Bot — RSI + VWAP strategy
 
-Автоматический торговый бот для биржи OKX, реализующий стратегию на основе индикаторов RSI и VWAP с продвинутым управлением рисками.
+An automated trading bot for the OKX exchange. It trades an **RSI + VWAP rejection** strategy with ATR-based position sizing and risk management. Originally written in C#, then rewritten in Go.
 
-## 🎯 Торговая стратегия
+> ⚠️ For educational purposes. Trading crypto derivatives carries a high risk of loss — test on a demo account first.
 
-### Что это за стратегия?
+## Strategy
 
-Бот использует **RSI + VWAP Rejection Strategy** - комбинацию двух популярных технических индикаторов:
+**Long entry**
+- short-period RSI crosses **above the oversold level** (`RsiOversold`)
+- the candle closes higher than the previous one but **below VWAP** (bounce off VWAP)
+- candle volume is above the minimum threshold
 
-1. **RSI (Relative Strength Index)** - индикатор силы тренда
-   - Показывает, перекуплен или перепродан актив
-   - Диапазон от 0 до 100
-   - Используется 2-периодный RSI для более чувствительных сигналов
+**Short entry**
+- RSI crosses **below the overbought level** (`RsiOverbought`)
+- the candle closes lower than the previous one but **above VWAP**
+- candle volume is above the minimum threshold
 
-2. **VWAP (Volume Weighted Average Price)** - средневзвешенная по объему цена
-   - Показывает справедливую цену актива за день
-   - Учитывает объемы торгов при расчете
-   - Используется как уровень поддержки/сопротивления
+**Risk management**
+- position size derived from ATR with a fixed risk per trade (`RiskPercent`)
+- stop loss and take profit at configurable ATR multiples (`ATRMultiplierSL`, `ATRMultiplierTP`)
+- optional trailing stop
+- WebSocket market data with REST fallback when the stream goes silent
+- one-candle cooldown between signals to avoid overtrading
 
-### Логика входа в позицию
-
-**Сигнал на покупку (LONG):**
-- RSI пересекает уровень 28 снизу вверх (выход из зоны перепроданности)
-- Цена закрытия свечи выше предыдущей, но ниже VWAP (отбой от VWAP)
-- Объем свечи больше минимального порога (500 BTC)
-
-**Сигнал на продажу (SHORT):**
-- RSI пересекает уровень 72 сверху вниз (выход из зоны перекупленности)  
-- Цена закрытия свечи ниже предыдущей, но выше VWAP (отбой от VWAP)
-- Объем свечи больше минимального порога
-
-### Управление рисками
-
-1. **Размер позиции**: Рассчитывается исходя из ATR (Average True Range)
-   - Риск фиксирован в процентах от депозита (по умолчанию 2%)
-   - Размер = Риск в USDT / (ATR × множитель)
-
-2. **Stop Loss**: ATR × 1.5 от цены входа
-3. **Take Profit**: ATR × 1.5 × коэффициент прибыли (1.0 по умолчанию)  
-4. **Таймаут позиции**: 4 часа максимальное время удержания
-5. **Кулдаун**: 1 свеча между сигналами для избежания оверторговли
-
-## 🛠 Как это реализовано в коде
-
-### Архитектура
+## Project structure
 
 ```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Market Data   │───▶│  Trading Strategy │───▶│   Order Manager │
-│    Service      │    │                  │    │                 │
-│  (WebSocket)    │    │  RSI + VWAP      │    │  (REST API)     │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-         │                        │                        │
-         ▼                        ▼                        ▼
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Real-time     │    │   Signal         │    │   Position      │
-│   Price Data    │    │   Generation     │    │   Management    │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
+main.go                 — entry point
+bot/                    — strategy and order execution
+client/okx_client.go    — OKX REST client (signed requests)
+marketdata/websocket.go — OKX WebSocket market data
+handlers/webhooks.go    — HTTP API: TradingView signals (`POST /tv-signal`), `/ping`, `/status`
+config/                 — configuration loading
+Program.cs, botautotraide.cs — the original C# implementation
 ```
 
-### Ключевые компоненты
+## Getting started
 
-1. **OKXMarketDataService** (`botautotraide.cs:173-504`)
-   - Подключение к WebSocket OKX для получения реальных цен
-   - Загрузка исторических данных через REST API
-   - Обработка свечных данных 30-минутного таймфрейма
+Requirements: Go 1.21+, an OKX account with API keys.
 
-2. **AdvancedTradingStrategy** (`botautotraide.cs:944-1424`)
-   - Расчет индикаторов RSI, ATR, VWAP
-   - Генерация торговых сигналов
-   - Управление активными позициями
-
-3. **OKXRestClient** (`botautotraide.cs:549-929`)
-   - Размещение рыночных и алгоритмических ордеров
-   - Получение информации о балансе и позициях
-   - Rate limiting и обработка ошибок API
-
-4. **TradingBot** (`botautotraide.cs:1427-1625`)
-   - Координация всех компонентов
-   - Обработка webhook'ов от TradingView
-   - Автоматическое управление позициями
-
-### Расчет индикаторов
-
-**RSI (2-период):**
-```csharp
-// Расчет средних значений прибылей и убытков
-var avgGain = gains.Average();
-var avgLoss = losses.Average();
-var rsi = 100 - (100 / (1 + avgGain / avgLoss));
+```bash
+go mod tidy
+# fill in API keys and strategy settings in appsettings.json
+go run .
 ```
 
-**VWAP (дневной):**
-```csharp
-// Средневзвешенная цена по объему
-var sumPV = candles.Sum(c => ((c.High + c.Low + c.Close) / 3) * c.Volume);
-var sumV = candles.Sum(c => c.Volume);
-var vwap = sumPV / sumV;
-```
-
-**ATR (14-период):**
-```csharp
-// Истинный диапазон для каждой свечи
-var trueRange = Math.Max(high - low, Math.Max(Math.Abs(high - prevClose), Math.Abs(low - prevClose)));
-var atr = trueRanges.Average();
-```
-
-## 🚀 Как работает бот
-
-### Запуск и инициализация
-
-1. **Подключение к OKX API** с использованием ключей из `appsettings.json`
-2. **Загрузка исторических данных** (500 свечей 30m) для инициализации индикаторов
-3. **Подписка на WebSocket** для получения реальных цен SOL-USDT
-4. **Запуск веб-сервера** на порту 5000 для приема webhook'ов
-
-### Торговый цикл
-
-1. **Каждые 5 секунд**: Проверка новых свечей через REST API
-2. **При получении новой свечи**:
-   - Обновление буферов данных
-   - Расчет индикаторов RSI, ATR, VWAP
-   - Проверка условий для генерации сигнала
-3. **При генерации сигнала**:
-   - Размещение рыночного ордера на вход
-   - Выставление Stop Loss и Take Profit
-   - Добавление позиции в трекинг
-
-### Webhook интеграция
-
-Бот поддерживает webhook'и от TradingView:
-
-**Endpoint**: `POST http://localhost:5000/tv-signal`
-
-**Формат**:
-```json
-{
-  "Side": "buy",
-  "Price": 185.50,
-  "Time": 1640995200
-}
-```
-
-### Мониторинг
-
-- **Status endpoint**: `GET http://localhost:5000/status`
-- **Логи в консоли**: Все торговые действия и ошибки
-- **Ping endpoint**: `GET http://localhost:5000/ping`
-
-## ⚙️ Настройка
-
-Параметры стратегии в `appsettings.json`:
+Configuration (`appsettings.json`):
 
 ```json
 {
+  "OKX": {
+    "ApiKey": "<api key>",
+    "ApiSecret": "<api secret>",
+    "Passphrase": "<passphrase>",
+    "InstrumentId": "SOL-USDT-SWAP",
+    "Timeframe": "15m"
+  },
   "Strategy": {
-    "RiskPercent": 2,          // Риск на сделку (% от депозита)
-    "RewardRatio": 2.0,        // Соотношение прибыль/риск  
-    "RsiLength": 14,           // Период RSI
-    "AtrLength": 14,           // Период ATR
-    "UseTrailingStop": false,  // Использовать трейлинг-стоп
-    "TrailingPercent": 1.5     // Процент трейлинга
+    "RsiLength": 2,
+    "RsiOverbought": 80,
+    "RsiOversold": 20,
+    "ATRLength": 14,
+    "ATRMultiplierSL": 1.5,
+    "ATRMultiplierTP": 1.5,
+    "CooldownBars": 1,
+    "RiskPercent": 2
   }
 }
 ```
 
-## 💡 Преимущества стратегии
-
-1. **Объективность**: Использует математические индикаторы, исключая эмоции
-2. **Управление рисками**: Фиксированный риск на каждую сделку
-3. **Автоматизация**: Работает 24/7 без участия человека
-4. **Гибкость**: Настраиваемые параметры под разные рыночные условия
-5. **Бэктестинг**: Возможность тестирования на исторических данных
-
-## ⚠️ Риски
-
-- **Боковой рынок**: Стратегия может генерировать много ложных сигналов
-- **Слипаж**: Рыночные ордера могут исполняться по худшей цене
-- **Технические сбои**: Потеря соединения или ошибки API
-- **Высокая волатильность**: Стоп-лоссы могут срабатывать слишком часто
+Docker: `docker compose up -d --build`. See [`README-Go.md`](README-Go.md), [`QUICK_START.md`](QUICK_START.md) and [`README-Deployment.md`](README-Deployment.md).
